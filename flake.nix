@@ -164,6 +164,11 @@
                       Grant) flow for MFA, and Hello authentication will be disabled.
                     '';
                   };
+                  enable_experimental_passwordless_fido = mkOption {
+                    type = types.bool;
+                    default = false;
+                    description = "Manually added option for FIDO support.";
+                  };
                   cn_name_mapping = mkOption {
                     type = types.bool;
                     default = true;
