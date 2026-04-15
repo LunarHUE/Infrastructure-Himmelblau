@@ -1,3 +1,4 @@
+use crate::constants::DEFAULT_HELLO_TOTP_ENABLED;
 /*
    Unix Azure Entra ID implementation
    Copyright (C) David Mulder <dmulder@samba.org> 2024
@@ -17,6 +18,7 @@
 */
 use crate::unix_passwd::parse_etc_passwd;
 use configparser::ini::Ini;
+use oauth2::url;
 use std::fmt;
 use std::fs::File;
 use std::io::Error;
@@ -26,19 +28,21 @@ use std::process::Command;
 use tracing::{debug, error};
 
 use crate::constants::{
-    CN_NAME_MAPPING, DEFAULT_AUTHORITY_HOST, DEFAULT_BROKER_SOCK_PATH, DEFAULT_CACHE_TIMEOUT,
-    DEFAULT_CONFIG_PATH, DEFAULT_CONN_TIMEOUT, DEFAULT_DB_PATH, DEFAULT_HELLO_ENABLED,
+    CN_NAME_MAPPING, DEFAULT_ALLOW_REMOTE_HELLO, DEFAULT_AUTHORITY_HOST, DEFAULT_BROKER_SOCK_PATH,
+    DEFAULT_CACHE_TIMEOUT, DEFAULT_CONFIG_PATH, DEFAULT_CONN_TIMEOUT,
+    DEFAULT_CONSOLE_PASSWORD_ONLY, DEFAULT_DB_PATH, DEFAULT_FIDO_TIMEOUT, DEFAULT_HELLO_ENABLED,
     DEFAULT_HELLO_PIN_MIN_LEN, DEFAULT_HELLO_PIN_RETRY_COUNT, DEFAULT_HOME_ALIAS,
     DEFAULT_HOME_ATTR, DEFAULT_HOME_PREFIX, DEFAULT_HSM_PIN_PATH, DEFAULT_ID_ATTR_MAP,
     DEFAULT_JOIN_TYPE, DEFAULT_ODC_PROVIDER, DEFAULT_OFFLINE_BREAKGLASS_TTL,
-    DEFAULT_POLICIES_DB_DIR, DEFAULT_SELINUX, DEFAULT_SFA_FALLBACK_ENABLED, DEFAULT_SHELL,
-    DEFAULT_SOCK_PATH, DEFAULT_TASK_SOCK_PATH, DEFAULT_TPM_TCTI_NAME, DEFAULT_USER_MAP_FILE,
-    DEFAULT_USE_ETC_SKEL, MAPPED_NAME_CACHE, SERVER_CONFIG_PATH,
+    DEFAULT_PASSWORD_ONLY_REMOTE_SERVICES_DENY_LIST, DEFAULT_POLICIES_DB_DIR, DEFAULT_SELINUX,
+    DEFAULT_SFA_FALLBACK_ENABLED, DEFAULT_SHELL, DEFAULT_SOCK_PATH, DEFAULT_TASK_SOCK_PATH,
+    DEFAULT_TPM_TCTI_NAME, DEFAULT_USER_MAP_FILE, DEFAULT_USE_ETC_SKEL, MAPPED_NAME_CACHE,
+    SERVER_CONFIG_PATH,
 };
 use crate::mapping::{MappedNameCache, Mode};
 use crate::unix_config::{HomeAttr, HsmType};
 use himmelblau::error::MsalError;
-use idmap::DEFAULT_IDMAP_RANGE;
+use idmap::{DEFAULT_IDMAP_RANGE, DEFAULT_SUBID_RANGE};
 use reqwest::Url;
 use serde::Deserialize;
 use std::env;
@@ -319,13 +323,6 @@ impl HimmelblauConfig {
         }
     }
 
-    pub fn get_app_id(&self, domain: &str) -> Option<String> {
-        match self.config.get(domain, "app_id") {
-            Some(val) => Some(val),
-            None => self.config.get("global", "app_id"),
-        }
-    }
-
     pub fn get_idmap_range(&self, domain: &str) -> (u32, u32) {
         let default_range = DEFAULT_IDMAP_RANGE;
         match self.config.get(domain, "idmap_range") {
@@ -369,61 +366,62 @@ impl HimmelblauConfig {
         }
     }
 
-    pub fn get_socket_path(&self) -> String {
-        match self.config.get("global", "socket_path") {
-            Some(val) => val,
-            None => DEFAULT_SOCK_PATH.to_string(),
-        }
-    }
-
-    pub fn get_task_socket_path(&self) -> String {
-        match self.config.get("global", "task_socket_path") {
-            Some(val) => val,
-            None => DEFAULT_TASK_SOCK_PATH.to_string(),
-        }
-    }
-
-    pub fn get_broker_socket_path(&self) -> String {
-        match self.config.get("global", "broker_socket_path") {
-            Some(val) => val,
-            None => DEFAULT_BROKER_SOCK_PATH.to_string(),
-        }
-    }
-
-    pub fn get_connection_timeout(&self) -> u64 {
-        match self.config.get("global", "connection_timeout") {
-            Some(val) => match val.parse::<u64>() {
-                Ok(n) => n,
-                Err(_) => {
-                    error!("Failed parsing connection_timeout from config: {}", val);
-                    DEFAULT_CONN_TIMEOUT
-                }
-            },
-            None => DEFAULT_CONN_TIMEOUT,
-        }
-    }
-
-    pub fn get_cache_timeout(&self) -> u64 {
-        match self.config.get("global", "cache_timeout") {
-            Some(val) => match val.parse::<u64>() {
-                Ok(n) => n,
-                Err(_) => {
-                    error!("Failed parsing cache_timeout from config: {}", val);
-                    DEFAULT_CACHE_TIMEOUT
-                }
-            },
-            None => DEFAULT_CACHE_TIMEOUT,
-        }
-    }
-
     pub fn get_unix_sock_timeout(&self) -> u64 {
         self.get_connection_timeout().saturating_mul(2)
     }
 
-    pub fn get_db_path(&self) -> String {
-        match self.config.get("global", "db_path") {
+    /// Get the subordinate ID range for container support (podman, etc.)
+    /// Returns the configured range, or the default range if not configured.
+    pub fn get_subid_range(&self) -> (u32, u32) {
+        let default_range = DEFAULT_SUBID_RANGE;
+        match self.config.get("global", "subid_range") {
+            Some(val) => {
+                let vals: Vec<u32> = val
+                    .split('-')
+                    .map(|m| m.parse())
+                    .collect::<Result<Vec<u32>, _>>()
+                    .unwrap_or_else(|_| vec![default_range.0, default_range.1]);
+                match vals.as_slice() {
+                    [min, max] => (*min, *max),
+                    _ => {
+                        error!("Invalid range specified [global] subid_range = {}", val);
+                        default_range
+                    }
+                }
+            }
+            None => default_range,
+        }
+    }
+
+    pub fn get_authority_host(&self, domain: &str) -> String {
+        match self.config.get(domain, "authority_host") {
             Some(val) => val,
-            None => DEFAULT_DB_PATH.to_string(),
+            None => {
+                debug!("authority_host unset, using defaults");
+                String::from(DEFAULT_AUTHORITY_HOST)
+            }
+        }
+    }
+
+    pub fn get_tenant_id(&self, domain: &str) -> Option<String> {
+        self.config.get(domain, "tenant_id")
+    }
+
+    pub fn get_graph_url(&self, domain: &str) -> Option<String> {
+        self.config.get(domain, "graph_url")
+    }
+
+    pub fn get_app_id(&self, domain: &str) -> Option<String> {
+        match self.config.get(domain, "app_id") {
+            Some(val) => Some(val),
+            None => self.config.get("global", "app_id"),
+        }
+    }
+
+    pub fn get_logon_token_app_id(&self, domain: &str) -> Option<String> {
+        match self.config.get(domain, "logon_token_app_id") {
+            Some(val) => Some(val),
+            None => self.config.get("global", "logon_token_app_id"),
         }
     }
 
@@ -460,17 +458,6 @@ impl HimmelblauConfig {
                 None => DEFAULT_HSM_PIN_PATH.to_string(),
             },
         }
-    }
-
-    pub fn get_tpm_tcti_name(&self) -> String {
-        match self.config.get("global", "tpm_tcti_name") {
-            Some(val) => val,
-            None => DEFAULT_TPM_TCTI_NAME.to_string(),
-        }
-    }
-
-    pub fn get_apply_policy(&self) -> bool {
-        match_bool(self.config.get("global", "apply_policy"), false)
     }
 
     pub fn get_pam_allow_groups(&self) -> Vec<String> {
@@ -533,17 +520,6 @@ impl HimmelblauConfig {
         self.config.set(section, key, Some(value.to_string()));
     }
 
-    pub fn get_use_etc_skel(&self) -> bool {
-        match_bool(
-            self.config.get("global", "use_etc_skel"),
-            DEFAULT_USE_ETC_SKEL,
-        )
-    }
-
-    pub fn get_selinux(&self) -> bool {
-        match_bool(self.config.get("global", "selinux"), DEFAULT_SELINUX)
-    }
-
     pub fn get_configured_domains(&self) -> Vec<String> {
         let mut domains = match self.config.get("global", "domains") {
             Some(val) => val.split(',').map(|s| s.trim().to_string()).collect(),
@@ -555,7 +531,7 @@ impl HimmelblauConfig {
         };
         domains.extend(domain);
         let mut sections = self.config.sections();
-        sections.retain(|s| s != "global");
+        sections.retain(|s| s != "global" && s != "offline_breakglass");
         for section in sections {
             if !domains.contains(&section) {
                 domains.push(section);
@@ -566,13 +542,6 @@ impl HimmelblauConfig {
 
     pub fn get_config_file(&self) -> String {
         self.filename.clone()
-    }
-
-    pub fn get_enable_hello(&self) -> bool {
-        match_bool(
-            self.config.get("global", "enable_hello"),
-            DEFAULT_HELLO_ENABLED,
-        )
     }
 
     pub fn get_id_attr_map(&self) -> IdAttr {
@@ -600,90 +569,21 @@ impl HimmelblauConfig {
             })
     }
 
-    pub fn get_enable_sfa_fallback(&self) -> bool {
-        match_bool(
-            self.config.get("global", "enable_sfa_fallback"),
-            DEFAULT_SFA_FALLBACK_ENABLED,
-        )
-    }
-
-    pub fn get_debug(&self) -> bool {
-        match_bool(self.config.get("global", "debug"), false)
-    }
-
-    pub fn get_cn_name_mapping(&self) -> bool {
-        match_bool(
-            self.config.get("global", "cn_name_mapping"),
-            CN_NAME_MAPPING,
-        )
-    }
-
-    pub fn get_hello_pin_min_length(&self) -> usize {
-        match self.config.get("global", "hello_pin_min_length") {
-            Some(val) => match val.parse::<usize>() {
-                Ok(n) => n,
-                Err(_) => {
-                    error!("Failed parsing hello_pin_min_length from config: {}", val);
-                    DEFAULT_HELLO_PIN_MIN_LEN
-                }
-            },
-            None => DEFAULT_HELLO_PIN_MIN_LEN,
-        }
-    }
-
-    pub fn get_hello_pin_retry_count(&self) -> u32 {
-        match self.config.get("global", "hello_pin_retry_count") {
-            Some(val) => match val.parse::<u32>() {
-                Ok(n) => n,
-                Err(_) => {
-                    error!("Failed parsing hello_pin_retry_count from config: {}", val);
-                    DEFAULT_HELLO_PIN_RETRY_COUNT
-                }
-            },
-            None => DEFAULT_HELLO_PIN_RETRY_COUNT,
-        }
-    }
-
-    pub fn get_authority_host(&self, domain: &str) -> String {
-        match self.config.get(domain, "authority_host") {
-            Some(val) => val,
-            None => {
-                debug!("authority_host unset, using defaults");
-                String::from(DEFAULT_AUTHORITY_HOST)
-            }
-        }
-    }
-
-    pub fn get_tenant_id(&self, domain: &str) -> Option<String> {
-        self.config.get(domain, "tenant_id")
-    }
-
-    pub fn get_graph_url(&self, domain: &str) -> Option<String> {
-        self.config.get(domain, "graph_url")
-    }
-
-    pub fn get_local_groups(&self) -> Vec<String> {
-        match self.config.get("global", "local_groups") {
-            Some(val) => val.split(',').map(|s| s.trim().to_string()).collect(),
-            None => vec![],
-        }
-    }
-
-    pub fn get_logon_script(&self) -> Option<String> {
-        self.config.get("global", "logon_script")
-    }
-
-    pub fn get_logon_token_scopes(&self) -> Vec<String> {
-        match self.config.get("global", "logon_token_scopes") {
-            Some(scopes) => scopes.split(",").map(|s| s.to_string()).collect(),
-            None => vec![],
-        }
-    }
-
-    pub fn get_logon_token_app_id(&self, domain: &str) -> Option<String> {
-        match self.config.get(domain, "logon_token_app_id") {
-            Some(val) => Some(val),
-            None => self.config.get("global", "logon_token_app_id"),
+    pub fn get_password_only_remote_services_deny_list(&self) -> Vec<String> {
+        match self
+            .config
+            .get("global", "password_only_remote_services_deny_list")
+        {
+            Some(val) => val
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => DEFAULT_PASSWORD_ONLY_REMOTE_SERVICES_DENY_LIST
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 
@@ -692,36 +592,6 @@ impl HimmelblauConfig {
             .get_primary_domain_from_alias_simple(domain)
             .unwrap_or(domain.to_string());
         self.config.get(&domain, "intune_device_id")
-    }
-
-    pub fn get_enable_experimental_mfa(&self) -> bool {
-        match_bool(self.config.get("global", "enable_experimental_mfa"), true)
-    }
-
-    pub fn get_enable_experimental_passwordless_fido(&self) -> bool {
-        match_bool(
-            self.config
-                .get("global", "enable_experimental_passwordless_fido"),
-            false,
-        )
-    }
-
-    pub fn get_mfa_method(&self) -> Option<String> {
-        self.config.get("global", "mfa_method")
-    }
-
-    pub fn get_hello_pin_prompt(&self) -> String {
-        match self.config.get("global", "hello_pin_prompt") {
-            Some(val) => val,
-            None => "Use the Linux Hello PIN for this device.".to_string(),
-        }
-    }
-
-    pub fn get_entra_id_password_prompt(&self) -> String {
-        match self.config.get("global", "entra_id_password_prompt") {
-            Some(val) => val,
-            None => "Use the password for your Office 365 or Microsoft online login.".to_string(),
-        }
     }
 
     pub fn get_primary_domain_from_alias_simple(&self, alias: &str) -> Option<String> {
@@ -756,6 +626,11 @@ impl HimmelblauConfig {
     }
 
     pub async fn get_primary_domain_from_alias(&mut self, alias: &str) -> Option<String> {
+        // Short-circuit the request if this is an OIDC provider domain.
+        if self.get_oidc_issuer_url().is_some() {
+            return None;
+        }
+
         // Attempt to short-circut the request by checking if the alias is
         // already configured.
         if let Some(primary) = self.get_primary_domain_from_alias_simple(alias) {
@@ -821,10 +696,6 @@ impl HimmelblauConfig {
             let _ = self.write_server_config();
         }
         None
-    }
-
-    pub fn get_name_mapping_script(&self) -> Option<String> {
-        self.config.get("global", "name_mapping_script")
     }
 
     /// This function attempts to convert a username to a valid UPN. On failure it
@@ -929,10 +800,7 @@ impl HimmelblauConfig {
     }
 
     pub fn get_sudo_groups(&self) -> Vec<String> {
-        let mut sudo_groups = match self.config.get("global", "sudo_groups") {
-            Some(val) => val.split(',').map(|s| s.trim().to_string()).collect(),
-            None => vec![],
-        };
+        let mut sudo_groups: Vec<String> = vec![];
         for section in self.config.sections() {
             sudo_groups.extend(match self.config.get(&section, "sudo_groups") {
                 Some(val) => val.split(',').map(|s| s.trim().to_string()).collect(),
@@ -942,30 +810,33 @@ impl HimmelblauConfig {
         sudo_groups
     }
 
-    pub fn get_local_sudo_group(&self) -> String {
-        match self.config.get("global", "local_sudo_group") {
-            Some(val) => val,
-            None => "sudo".to_string(),
+    pub fn get_oidc_issuer_url(&self) -> Option<String> {
+        let res = self.config.get("global", "oidc_issuer_url").map(|s| {
+            s.trim()
+                .strip_suffix("/.well-known/openid-configuration")
+                .unwrap_or(s.trim())
+                .to_string()
+        });
+        if let Some(ref s) = res {
+            if s.is_empty() {
+                return None;
+            } else if !s.starts_with("https://") {
+                error!("OIDC issuer URL must use https://");
+                return None;
+            } else if s.contains('?') || s.contains('#') {
+                warn!("OIDC issuer URL must not contain query or fragment");
+                return None;
+            } else if url::Url::parse(s).is_err() {
+                error!("OIDC issuer URL is not a valid URL");
+                return None;
+            }
         }
-    }
-
-    pub fn get_user_map_file(&self) -> String {
-        self.config
-            .get("global", "user_map_file")
-            .unwrap_or(DEFAULT_USER_MAP_FILE.to_string())
-    }
-
-    pub fn get_offline_breakglass_enabled(&self) -> bool {
-        match_bool(self.config.get("offline_breakglass", "enabled"), false)
-    }
-
-    pub fn get_offline_breakglass_ttl(&self) -> u64 {
-        match self.config.get("offline_breakglass", "ttl") {
-            Some(val) => parse_ttl_to_seconds(&val).unwrap_or(DEFAULT_OFFLINE_BREAKGLASS_TTL),
-            None => DEFAULT_OFFLINE_BREAKGLASS_TTL,
-        }
+        res
     }
 }
+
+// Generated getter methods from XML parameter definitions.
+include!(concat!(env!("OUT_DIR"), "/config_gen.rs"));
 
 impl fmt::Debug for HimmelblauConfig {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -986,6 +857,12 @@ mod tests {
         file_path
     }
 
+    // Helper function to create an empty config (to test defaults without system config interference)
+    fn create_empty_config() -> HimmelblauConfig {
+        let temp_file = create_temp_config("");
+        HimmelblauConfig::new(Some(&temp_file)).unwrap()
+    }
+
     #[test]
     fn test_get_home_prefix() {
         let config_data = r#"
@@ -1001,7 +878,7 @@ mod tests {
 
         assert_eq!(config.get_home_prefix(Some("example.com")), "/home/example");
         assert_eq!(config.get_home_prefix(None), "/home/global");
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(
             config_empty.get_home_prefix(Some("unknown.com")),
             DEFAULT_HOME_PREFIX
@@ -1023,7 +900,7 @@ mod tests {
 
         assert_eq!(config.get_shell(Some("example.com")), "/bin/zsh");
         assert_eq!(config.get_shell(None), "/bin/bash");
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_shell(Some("unknown.com")), DEFAULT_SHELL);
     }
 
@@ -1038,7 +915,7 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_connection_timeout(), 45);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_connection_timeout(), 30);
     }
 
@@ -1057,8 +934,25 @@ mod tests {
 
         assert_eq!(config.get_idmap_range("example.com"), (5000, 6000));
         assert_eq!(config.get_idmap_range("unknown.com"), (1000, 2000));
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_idmap_range("any.com"), DEFAULT_IDMAP_RANGE);
+    }
+
+    #[test]
+    fn test_get_subid_range() {
+        let config_data = r#"
+        [global]
+        subid_range = 100000-999999
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        assert_eq!(config.get_subid_range(), (100000, 999999));
+
+        // When not configured, use the default range
+        let config_empty = create_empty_config();
+        assert_eq!(config_empty.get_subid_range(), DEFAULT_SUBID_RANGE);
     }
 
     #[test]
@@ -1072,7 +966,7 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_broker_socket_path(), "/var/run/broker.sock");
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(
             config_empty.get_broker_socket_path(),
             DEFAULT_BROKER_SOCK_PATH
@@ -1115,7 +1009,7 @@ mod tests {
         let temp_file = create_temp_config(config_data);
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
         assert_eq!(config.get_join_type(), JoinType::Register);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_join_type(), JoinType::Join);
 
         let config_data = r#"
@@ -1148,15 +1042,15 @@ mod tests {
     fn test_get_apply_policy() {
         let config_data = r#"
         [global]
-        apply_policy = true
+        apply_policy = false
         "#;
 
         let temp_file = create_temp_config(config_data);
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
-        assert_eq!(config.get_apply_policy(), true);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
-        assert_eq!(config_empty.get_apply_policy(), false);
+        assert_eq!(config.get_apply_policy(), false);
+        let config_empty = create_empty_config();
+        assert_eq!(config_empty.get_apply_policy(), true);
     }
 
     #[test]
@@ -1174,7 +1068,7 @@ mod tests {
 
         assert_eq!(config.get_home_attr(None), HomeAttr::Cn);
         assert_eq!(config.get_home_attr(Some("example.com")), HomeAttr::Spn);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_home_attr(None), HomeAttr::Uuid);
     }
 
@@ -1196,7 +1090,7 @@ mod tests {
             config.get_home_alias(Some("example.com")),
             Some(HomeAttr::Uuid)
         );
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(
             config_empty.get_home_alias(Some("unknown.com")),
             Some(HomeAttr::Spn)
@@ -1221,7 +1115,7 @@ mod tests {
             config.get_odc_provider("example.com"),
             "odc.officeapps.live.com"
         );
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(
             config_empty.get_odc_provider("unknown.com"),
             DEFAULT_ODC_PROVIDER
@@ -1243,7 +1137,7 @@ mod tests {
             config.get_app_id("example.com"),
             Some("70fee399-7cd8-42f9-a0ea-1e12ea308908".to_string())
         );
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_app_id("example.com"), None);
     }
 
@@ -1258,7 +1152,7 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_socket_path(), "/var/run/socket_path.sock");
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_socket_path(), DEFAULT_SOCK_PATH);
     }
 
@@ -1273,7 +1167,7 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_task_socket_path(), "/var/run/task_socket.sock");
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_task_socket_path(), DEFAULT_TASK_SOCK_PATH);
     }
 
@@ -1288,7 +1182,7 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_cache_timeout(), 120);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_cache_timeout(), DEFAULT_CACHE_TIMEOUT);
     }
 
@@ -1303,7 +1197,7 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_unix_sock_timeout(), 30);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(
             config_empty.get_unix_sock_timeout(),
             DEFAULT_CONN_TIMEOUT * 2
@@ -1348,7 +1242,7 @@ mod tests {
         let temp_file = create_temp_config(config_data);
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
         assert_eq!(config.get_hsm_type(), alt);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_hsm_type(), default);
     }
 
@@ -1364,7 +1258,7 @@ mod tests {
 
         assert_eq!(config.get_use_etc_skel(), true);
 
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_use_etc_skel(), false);
     }
 
@@ -1414,8 +1308,25 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_enable_hello(), false);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_enable_hello(), DEFAULT_HELLO_ENABLED);
+    }
+
+    #[test]
+    fn test_get_enable_passwordless() {
+        let config_data = r#"
+        [global]
+        enable_passwordless = false
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        assert_eq!(config.get_enable_passwordless(), false);
+
+        // Test that default is true (backward compat)
+        let config_empty = create_empty_config();
+        assert_eq!(config_empty.get_enable_passwordless(), true);
     }
 
     #[test]
@@ -1429,7 +1340,7 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_enable_experimental_mfa(), false);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_enable_experimental_mfa(), true);
     }
 
@@ -1447,7 +1358,7 @@ mod tests {
         assert_eq!(config.get_enable_experimental_passwordless_fido(), true);
 
         // Test fallback default (false) when config is missing
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(
             config_empty.get_enable_experimental_passwordless_fido(),
             false
@@ -1465,7 +1376,7 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_debug(), true);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_debug(), false);
     }
 
@@ -1480,7 +1391,7 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_cn_name_mapping(), false);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_cn_name_mapping(), CN_NAME_MAPPING);
     }
 
@@ -1498,7 +1409,7 @@ mod tests {
             config.get_authority_host("example.com"),
             "https://login.suse.com"
         );
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(
             config_empty.get_authority_host("example.com"),
             DEFAULT_AUTHORITY_HOST
@@ -1519,7 +1430,7 @@ mod tests {
             config.get_graph_url("example.com"),
             Some("https://graph.suse.com".to_string())
         );
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_graph_url("example.com"), None);
     }
 
@@ -1534,7 +1445,7 @@ mod tests {
         let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
 
         assert_eq!(config.get_selinux(), true);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_selinux(), DEFAULT_SELINUX);
     }
 
@@ -1559,7 +1470,7 @@ mod tests {
         let config_invalid = HimmelblauConfig::new(Some(&temp_file_invalid)).unwrap();
         assert_eq!(config_invalid.get_id_attr_map(), DEFAULT_ID_ATTR_MAP);
 
-        let config_missing = HimmelblauConfig::new(None).unwrap();
+        let config_missing = create_empty_config();
         assert_eq!(config_missing.get_id_attr_map(), DEFAULT_ID_ATTR_MAP);
     }
 
@@ -1584,7 +1495,7 @@ mod tests {
             config_invalid.get_hello_pin_min_length(),
             DEFAULT_HELLO_PIN_MIN_LEN
         );
-        let config_missing = HimmelblauConfig::new(None).unwrap();
+        let config_missing = create_empty_config();
         assert_eq!(
             config_missing.get_hello_pin_min_length(),
             DEFAULT_HELLO_PIN_MIN_LEN
@@ -1606,7 +1517,7 @@ mod tests {
             Some("example-tenant-id".to_string())
         );
         assert_eq!(config.get_tenant_id("nonexistent.com"), None);
-        let config_missing = HimmelblauConfig::new(None).unwrap();
+        let config_missing = create_empty_config();
         assert_eq!(config_missing.get_tenant_id("example.com"), None);
     }
 
@@ -1626,7 +1537,7 @@ mod tests {
             "group3".to_string(),
         ];
         assert_eq!(config.get_local_groups(), expected_groups);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_local_groups(), Vec::<String>::new());
     }
 
@@ -1644,7 +1555,7 @@ mod tests {
             config.get_logon_script(),
             Some("/path/to/logon/script".to_string())
         );
-        let config_missing = HimmelblauConfig::new(None).unwrap();
+        let config_missing = create_empty_config();
         assert_eq!(config_missing.get_logon_script(), None);
     }
 
@@ -1665,7 +1576,7 @@ mod tests {
 
         // Test missing domain
         assert_eq!(config.get_intune_device_id("missing.com"), None);
-        let config_missing = HimmelblauConfig::new(None).unwrap();
+        let config_missing = create_empty_config();
         assert_eq!(config_missing.get_intune_device_id("example.com"), None);
     }
 
@@ -1685,7 +1596,7 @@ mod tests {
             "scope3".to_string(),
         ];
         assert_eq!(config.get_logon_token_scopes(), expected_scopes);
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_logon_token_scopes(), Vec::<String>::new());
     }
 
@@ -1708,7 +1619,7 @@ mod tests {
         assert_eq!(config.get_logon_token_app_id("missing.com"), None);
 
         // Test empty configuration
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_logon_token_app_id("example.com"), None);
     }
 
@@ -1729,7 +1640,7 @@ mod tests {
         );
 
         // Test when config is missing (should return None)
-        let config_empty = HimmelblauConfig::new(None).unwrap();
+        let config_empty = create_empty_config();
         assert_eq!(config_empty.get_mfa_method(), None);
 
         // Test with different MFA method
@@ -1774,7 +1685,7 @@ mod tests {
             Some("/path/to/name_mapping_script".to_string())
         );
 
-        let config_missing = HimmelblauConfig::new(None).unwrap();
+        let config_missing = create_empty_config();
         assert_eq!(config_missing.get_name_mapping_script(), None);
     }
 
@@ -1846,6 +1757,53 @@ mod tests {
         let account_id = "user";
 
         assert_eq!(config.map_name_to_upn(account_id), account_id.to_string());
+    }
+
+    #[test]
+    fn test_get_local_sudo_group() {
+        let config_data = r#"
+        [global]
+        local_sudo_group = wheel
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        let group = config.get_local_sudo_group();
+
+        assert_eq!(group, "wheel");
+
+        let empty_config = create_empty_config();
+
+        let default_group = empty_config.get_local_sudo_group();
+
+        assert_eq!(default_group, "sudo")
+    }
+
+    #[test]
+    fn test_get_sudo_groups() {
+        let config_data = r#"
+        [example.com]
+        sudo_groups = 2eb4e6a2-f55d-4cf4-8e62-978f9f4a828d,f791d7c2-66cd-4f67-a195-72c6faf3c3b5
+
+        [global]
+        sudo_groups = 825d1f7e-c4cd-4fc2-aeeb-1f92357f8da6,0149b437-fbaa-4419-bf46-f9a9f9a3438c
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        let mut groups = config.get_sudo_groups();
+        groups.sort();
+        let mut expected_groups: Vec<String> = vec![
+            "825d1f7e-c4cd-4fc2-aeeb-1f92357f8da6".to_string(),
+            "0149b437-fbaa-4419-bf46-f9a9f9a3438c".to_string(),
+            "2eb4e6a2-f55d-4cf4-8e62-978f9f4a828d".to_string(),
+            "f791d7c2-66cd-4f67-a195-72c6faf3c3b5".to_string(),
+        ];
+        expected_groups.sort();
+
+        assert_eq!(groups, expected_groups);
     }
 
     #[test]
@@ -1937,5 +1895,243 @@ mod tests {
             config.get_offline_breakglass_ttl(),
             DEFAULT_OFFLINE_BREAKGLASS_TTL
         );
+    }
+
+    #[test]
+    fn test_get_password_only_remote_services_deny_list_comma_separated() {
+        let config_data = r#"
+        [global]
+        password_only_remote_services_deny_list = ssh,telnet,ftp
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        let result = config.get_password_only_remote_services_deny_list();
+        assert_eq!(result, vec!["ssh", "telnet", "ftp"]);
+    }
+
+    #[test]
+    fn test_get_password_only_remote_services_deny_list_whitespace_trimming() {
+        let config_data = r#"
+        [global]
+        password_only_remote_services_deny_list = ssh , telnet,  ftp  ,vnc
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        let result = config.get_password_only_remote_services_deny_list();
+        assert_eq!(result, vec!["ssh", "telnet", "ftp", "vnc"]);
+    }
+
+    #[test]
+    fn test_get_password_only_remote_services_deny_list_empty_string() {
+        let config_data = r#"
+        [global]
+        password_only_remote_services_deny_list =
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        let result = config.get_password_only_remote_services_deny_list();
+        // Empty string should be filtered out to prevent matching all services
+        assert_eq!(result, Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_get_password_only_remote_services_deny_list_default_value() {
+        let config_data = r#"
+        [global]
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        let result = config.get_password_only_remote_services_deny_list();
+        // Should return the default list parsed from DEFAULT_PASSWORD_ONLY_REMOTE_SERVICES_DENY_LIST
+        let expected: Vec<String> = DEFAULT_PASSWORD_ONLY_REMOTE_SERVICES_DENY_LIST
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(result, expected);
+        // Verify default contains expected services
+        assert!(result.contains(&"ssh".to_string()));
+        assert!(result.contains(&"telnet".to_string()));
+    }
+
+    #[test]
+    fn test_get_password_only_remote_services_deny_list_case_sensitivity() {
+        // Values are stored as-is (case-sensitive). The caller (himmelblau.rs)
+        // may apply case-insensitive matching, but the config parser preserves case.
+        let config_data = r#"
+        [global]
+        password_only_remote_services_deny_list = SSH,Telnet,FTP
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        let result = config.get_password_only_remote_services_deny_list();
+        assert_eq!(result, vec!["SSH", "Telnet", "FTP"]);
+        // Case is preserved - these are not lowercased
+        assert!(result.contains(&"SSH".to_string()));
+        assert!(!result.contains(&"ssh".to_string()));
+    }
+
+    #[test]
+    fn test_get_password_only_remote_services_deny_list_single_value() {
+        let config_data = r#"
+        [global]
+        password_only_remote_services_deny_list = ssh
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        let result = config.get_password_only_remote_services_deny_list();
+        assert_eq!(result, vec!["ssh"]);
+    }
+
+    // Tests for parse_ttl_to_seconds()
+
+    #[test]
+    fn test_parse_ttl_seconds() {
+        assert_eq!(parse_ttl_to_seconds("10"), Some(10));
+        assert_eq!(parse_ttl_to_seconds("10s"), Some(10));
+        assert_eq!(parse_ttl_to_seconds("10S"), Some(10));
+        assert_eq!(parse_ttl_to_seconds("0s"), Some(0));
+        assert_eq!(parse_ttl_to_seconds("1"), Some(1));
+    }
+
+    #[test]
+    fn test_parse_ttl_minutes() {
+        assert_eq!(parse_ttl_to_seconds("1m"), Some(60));
+        assert_eq!(parse_ttl_to_seconds("5m"), Some(300));
+        assert_eq!(parse_ttl_to_seconds("30M"), Some(1800));
+    }
+
+    #[test]
+    fn test_parse_ttl_hours() {
+        assert_eq!(parse_ttl_to_seconds("1h"), Some(3600));
+        assert_eq!(parse_ttl_to_seconds("2h"), Some(7200));
+        assert_eq!(parse_ttl_to_seconds("24H"), Some(86400));
+    }
+
+    #[test]
+    fn test_parse_ttl_days() {
+        assert_eq!(parse_ttl_to_seconds("1d"), Some(86400));
+        assert_eq!(parse_ttl_to_seconds("7d"), Some(604800));
+        assert_eq!(parse_ttl_to_seconds("30D"), Some(2592000));
+    }
+
+    #[test]
+    fn test_parse_ttl_whitespace() {
+        assert_eq!(parse_ttl_to_seconds("  10s  "), Some(10));
+        assert_eq!(parse_ttl_to_seconds("\t5m\n"), Some(300));
+    }
+
+    #[test]
+    fn test_parse_ttl_invalid() {
+        // Empty string
+        assert_eq!(parse_ttl_to_seconds(""), None);
+        // Invalid suffix
+        assert_eq!(parse_ttl_to_seconds("10x"), None);
+        assert_eq!(parse_ttl_to_seconds("10w"), None);
+        // Non-numeric
+        assert_eq!(parse_ttl_to_seconds("abc"), None);
+        assert_eq!(parse_ttl_to_seconds("tenm"), None);
+        // Negative (parse as u64 fails)
+        assert_eq!(parse_ttl_to_seconds("-10s"), None);
+        // Floating point
+        assert_eq!(parse_ttl_to_seconds("1.5h"), None);
+    }
+
+    // Tests for split_username()
+
+    #[test]
+    fn test_split_username_valid() {
+        assert_eq!(
+            split_username("user@example.com"),
+            Some(("user", "example.com"))
+        );
+        assert_eq!(
+            split_username("alice@contoso.onmicrosoft.com"),
+            Some(("alice", "contoso.onmicrosoft.com"))
+        );
+    }
+
+    #[test]
+    fn test_split_username_no_at() {
+        assert_eq!(split_username("username"), None);
+        assert_eq!(split_username(""), None);
+    }
+
+    #[test]
+    fn test_split_username_multiple_at() {
+        // More than one @ returns None (len != 2)
+        assert_eq!(split_username("user@domain@extra"), None);
+    }
+
+    #[test]
+    fn test_get_fido_timeout() {
+        let config_data = r#"
+        [global]
+        fido_timeout = 60
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        assert_eq!(config.get_fido_timeout(), 60);
+        let config_empty = create_empty_config();
+        assert_eq!(config_empty.get_fido_timeout(), 25);
+    }
+
+    #[test]
+    fn test_get_fido_prompt() {
+        let config_data = r#"
+        [global]
+        fido_prompt = Insert key now.
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        assert_eq!(config.get_fido_prompt(), "Insert key now.");
+        let config_empty = create_empty_config();
+        assert_eq!(
+            config_empty.get_fido_prompt(),
+            "Please insert your security key."
+        );
+    }
+
+    #[test]
+    fn test_get_fido_presence_prompt() {
+        let config_data = r#"
+        [global]
+        fido_presence_prompt = Touch key now.
+        "#;
+
+        let temp_file = create_temp_config(config_data);
+        let config = HimmelblauConfig::new(Some(&temp_file)).unwrap();
+
+        assert_eq!(config.get_fido_presence_prompt(), "Touch key now.");
+        let config_empty = create_empty_config();
+        assert_eq!(
+            config_empty.get_fido_presence_prompt(),
+            "Please touch your security key."
+        );
+    }
+
+    #[test]
+    fn test_split_username_edge_cases() {
+        // Empty parts are still valid splits
+        assert_eq!(split_username("@domain"), Some(("", "domain")));
+        assert_eq!(split_username("user@"), Some(("user", "")));
+        // Just @ sign
+        assert_eq!(split_username("@"), Some(("", "")));
     }
 }

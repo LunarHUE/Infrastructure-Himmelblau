@@ -23,19 +23,20 @@ console = ["dep:console-subscriber"]
 
 [dependencies]
 himmelblau_unix_common = { workspace = true }
+idmap = { workspace = true }
 tokio = { workspace = true, features = ["tracing"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
-bytes = "^1.11.0"
+bytes = "^1.11.1"
 uuid = { workspace = true }
 serde = { workspace = true }
 serde_json.workspace = true
-futures = "^0.3.28"
+futures = "^0.3.32"
 systemd-journal-logger = "^2.2.2"
 himmelblau_policies = { workspace = true }
-uzers = "^0.12.1"
+uzers = "^0.12.2"
 sketching = { workspace = true }
 walkdir = { workspace = true }
 libc = { workspace = true }
@@ -47,22 +48,29 @@ kanidm_lib_file_permissions.workspace = true
 identity_dbus_broker.workspace = true
 base64.workspace = true
 async-trait.workspace = true
-sd-notify = "0.4.5"
+sd-notify = { version = "0.5.0", features = ["fdstore"] }
+memfd = ">=0.6"
 libhimmelblau.workspace = true
+url.workspace = true
 console-subscriber = { workspace = true, optional = true }
+libkrimes = { workspace = true }
 
 [package.metadata.deb]
 name = "himmelblau"
 maintainer = "David Mulder <dmulder@suse.com>"
 depends = ["$auto"]
-recommends = ["nss-himmelblau", "pam-himmelblau", "krb5-user", "cron"]
+recommends = ["nss-himmelblau", "pam-himmelblau", "krb5-user", "cron", "tpm2-tools"]
 assets = [
   ["../../platform/debian/himmelblau.conf.example", "etc/himmelblau/himmelblau.conf", "644"],
-  ["../../src/config/krb5_himmelblau.conf", "etc/krb5.conf.d/", "644"],
-  ["../../src/config/gdm3_service_override.conf", "etc/systemd/system/gdm3.service.d/override.conf", "644"],
+  ["../../src/config/gdm3_service_override.conf", "usr/lib/systemd/system/gdm3.service.d/himmelblau-override.conf", "644"],
   ["target/release/aad-tool", "usr/bin/", "755"],
-  ["../../platform/debian/himmelblaud-tasks.service", "etc/systemd/system/", "644"],
-  ["../../platform/debian/himmelblaud.service", "etc/systemd/system/", "644"],
+  ["../../platform/debian/himmelblaud-tasks.service", "usr/lib/systemd/system/", "644"],
+  ["../../platform/debian/himmelblaud.service", "usr/lib/systemd/system/", "644"],
+  ["../../platform/debian/himmelblau-hsm-pin-init.service", "usr/lib/systemd/system/", "644"],
+  ["src/himmelblaud.socket", "usr/lib/systemd/system/", "644"],
+  ["src/himmelblaud-tasks.socket", "usr/lib/systemd/system/", "644"],
+  ["src/himmelblaud-broker.socket", "usr/lib/systemd/system/", "644"],
+  ["scripts/himmelblau-init-hsm-pin", "usr/libexec/", "755"],
   ["target/release/himmelblaud", "usr/sbin/", "755"],
   ["target/release/himmelblaud_tasks", "usr/sbin/", "755"],
   ["../../README.md", "usr/share/doc/himmelblau/README", "644"],
@@ -81,11 +89,15 @@ name = "himmelblau"
 maintainer = "David Mulder <dmulder@suse.com>"
 assets = [
   { source = "../../src/config/himmelblau.conf.example", dest = "/etc/himmelblau/himmelblau.conf", mode = "644", config = "noreplace" },
-  { source = "../../src/config/krb5_himmelblau.conf", dest = "/etc/krb5.conf.d/", mode = "644" },
   { source = "../../src/config/gdm3_service_override.conf", dest = "/usr/lib/systemd/system/display-manager.service.d/override.conf", mode = "644" },
   { source = "target/release/aad-tool", dest = "/usr/bin/", mode = "755" },
   { source = "../../platform/opensuse/himmelblaud-tasks.service", dest = "/usr/lib/systemd/system/", mode = "644" },
   { source = "../../platform/opensuse/himmelblaud.service", dest = "/usr/lib/systemd/system/", mode = "644" },
+  { source = "../../platform/opensuse/himmelblau-hsm-pin-init.service", dest = "/usr/lib/systemd/system/", mode = "644" },
+  { source = "src/himmelblaud.socket", dest = "/usr/lib/systemd/system/", mode = "644" },
+  { source = "src/himmelblaud-tasks.socket", dest = "/usr/lib/systemd/system/", mode = "644" },
+  { source = "src/himmelblaud-broker.socket", dest = "/usr/lib/systemd/system/", mode = "644" },
+  { source = "scripts/himmelblau-init-hsm-pin", dest = "/usr/libexec/", mode = "755" },
   { source = "target/release/himmelblaud", dest = "/usr/sbin/", mode = "755" },
   { source = "target/release/himmelblaud_tasks", dest = "/usr/sbin/", mode = "755" },
   { source = "../../README.md", dest = "/usr/share/doc/himmelblau/README", mode = "644" },
@@ -98,13 +110,19 @@ assets = [
   { source = "src/himmelblaud.tmpfiles.conf", dest = "/usr/lib/tmpfiles.d/himmelblaud.conf", mode = "644" },
 ]
 post_install_script = "scripts/postinst"
+pre_uninstall_script = "scripts/prerm"
+post_uninstall_script = "scripts/postrm"
 
 [package.metadata.generate-rpm.recommends]
 nss-himmelblau = "*"
 pam-himmelblau = "*"
+himmelblau-selinux = "*"
 krb5 = "*"
 cron = "*" # For Intune policy scripts
 system-user-tss = "*"
+# Boolean OR: covers tpm2-tools (Fedora/Rocky/Amazon) and tpm2.0-tools (openSUSE/SLE) in one
+# expression. Requires RPM 4.13+, which ships on all supported RPM targets.
+"(tpm2-tools or tpm2.0-tools)" = "*"
 
 [package.metadata.generate-rpm.provides]
 aad-cli = ""

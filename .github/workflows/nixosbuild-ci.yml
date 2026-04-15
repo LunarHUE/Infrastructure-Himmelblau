@@ -4,8 +4,8 @@ name: NixOS-CI
 # Trigger the workflow on push or pull request
 on:
   pull_request:
-    branches:
-      - main
+  push:
+    branches: [main]
 
 permissions:
   contents: read
@@ -14,14 +14,16 @@ jobs:
   nixos:
     runs-on: ubuntu-latest
     steps:
-    - name: Harden the runner (Audit all outbound calls)
-      uses: step-security/harden-runner@95d9a5deda9de15063e7595e9719c11c38c90ae2 # v2.13.2
-      with:
-        egress-policy: audit
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@fe104658747b27e96e4f7e80cd0a94068e53901d # v2.16.1
+        with:
+          egress-policy: audit
 
-    - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
-    - uses: cachix/install-nix-action@0b0e072294b088b73964f1d72dfdac0951439dbd # v31.8.4
-      with:
-        extra_nix_config: experimental-features = nix-command flakes
-    - run: nix flake check
-    - run: nix build --max-jobs 1 ".#himmelblau" ".#himmelblau-desktop" 2>&1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe # v31.10.3
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+
+      - uses: DeterminateSystems/magic-nix-cache-action@cec65ff6f104850203b152861d3f9e5f1747885d
+      - run: nix flake check
+      - run: nix build .#daemon .#sso .#broker .#pam .#nss .#aad-tool .#o365 2>&1

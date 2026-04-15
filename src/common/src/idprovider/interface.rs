@@ -11,12 +11,15 @@
 use crate::db::KeyStoreTxn;
 use crate::unix_proto::{PamAuthRequest, PamAuthResponse};
 use async_trait::async_trait;
-use himmelblau::{MFAAuthContinue, UserToken as UnixUserToken};
+use himmelblau::{AuthOption, MFAAuthContinue, UserToken as UnixUserToken};
+use kanidm_hsm_crypto::structures::SealedData;
+use libkrimes::proto::KerberosCredentials;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::SystemTime;
 use tokio::sync::broadcast;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 pub use kanidm_hsm_crypto as tpm;
 
@@ -94,14 +97,43 @@ pub struct UserToken {
 
 pub enum AuthCredHandler {
     MFA {
-        flow: MFAAuthContinue,
+        flow: Box<MFAAuthContinue>,
         password: Option<String>,
+        extra_data: Option<String>,
+        /// When set, this MFA flow was triggered by an expired PRT/refresh token
+        /// while the Hello key and PIN are still valid. Contains the validated
+        /// PIN to reuse for re-sealing the new PRT with the existing Hello key
+        /// after successful re-authentication. (See issue #1051)
+        reauth_hello_pin: Option<Zeroizing<String>>,
+    },
+    /// Password prompt for Hello re-authentication when Azure requires a
+    /// password before continuing MFA. Carries the validated Hello PIN so we
+    /// can re-seal tokens with the existing Hello key after MFA succeeds.
+    ReauthPassword {
+        reauth_hello_pin: Zeroizing<String>,
     },
     SetupPin {
-        token: UnixUserToken,
+        token: Box<Option<UnixUserToken>>,
+    },
+    HelloTOTP {
+        cred: String,
+        /// Sealed TOTP secret pending validation - only set during initial setup.
+        /// Will be saved to HSM after successful TOTP validation.
+        pending_sealed_totp: Option<SealedData>,
     },
     ChangePassword {
         old_cred: String,
+    },
+    /// Password-first authentication for console_password_only mode.
+    /// When this handler is active, we first validate the password via ROPC,
+    /// then check if sign-in frequency is satisfied via PRT exchange before
+    /// prompting for MFA. This allows skipping MFA when Azure's sign-in
+    /// frequency policy is already satisfied.
+    PasswordFirst {
+        /// Auth options to pass if we need to initiate MFA flow
+        auth_options: Vec<AuthOption>,
+        /// Whether the user is domain joined (affects resource URL in MFA flow)
+        is_domain_joined: bool,
     },
     None,
 }
@@ -110,8 +142,11 @@ impl fmt::Debug for AuthCredHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AuthCredHandler::MFA { .. } => f.write_str("MFA { .. }"),
+            AuthCredHandler::ReauthPassword { .. } => f.write_str("ReauthPassword { .. }"),
             AuthCredHandler::SetupPin { .. } => f.write_str("SetupPin { .. }"),
+            AuthCredHandler::HelloTOTP { .. } => f.write_str("HelloTOTP { .. }"),
             AuthCredHandler::ChangePassword { .. } => f.write_str("ChangePassword { .. }"),
+            AuthCredHandler::PasswordFirst { .. } => f.write_str("PasswordFirst { .. }"),
             AuthCredHandler::None => f.write_str("None"),
         }
     }
@@ -120,6 +155,9 @@ impl fmt::Debug for AuthCredHandler {
 pub enum AuthRequest {
     Password,
     MFACode {
+        msg: String,
+    },
+    HelloTOTP {
         msg: String,
     },
     MFAPoll {
@@ -154,6 +192,7 @@ impl Into<PamAuthResponse> for AuthRequest {
         match self {
             AuthRequest::Password => PamAuthResponse::Password,
             AuthRequest::MFACode { msg } => PamAuthResponse::MFACode { msg },
+            AuthRequest::HelloTOTP { msg } => PamAuthResponse::HelloTOTP { msg },
             AuthRequest::MFAPoll {
                 msg,
                 polling_interval,
@@ -216,24 +255,32 @@ pub trait IdProvider {
         _scopes: Vec<String>,
         _token: Option<&UserToken>,
         _client_id: Option<String>,
+        _redirect_uri: Option<String>,
+        _req_cnf: Option<String>,
         _keystore: &mut D,
         _tpm: &mut tpm::provider::BoxedDynTpm,
         _machine_key: &tpm::structures::StorageKey,
     ) -> Result<UnixUserToken, IdpError>;
 
-    async fn unix_user_ccaches<D: KeyStoreTxn + Send>(
+    async fn unix_user_tgts<D: KeyStoreTxn + Send>(
         &self,
         _id: &Id,
         _old_token: Option<&UserToken>,
         _keystore: &mut D,
         _tpm: &mut tpm::provider::BoxedDynTpm,
         _machine_key: &tpm::structures::StorageKey,
-    ) -> (Vec<u8>, Vec<u8>);
+    ) -> (
+        Option<Box<KerberosCredentials>>,
+        Option<Box<KerberosCredentials>>,
+        Option<String>,
+        Option<String>,
+    );
 
     async fn unix_user_prt_cookie<D: KeyStoreTxn + Send>(
         &self,
         _id: &Id,
         _token: Option<&UserToken>,
+        _sso_nonce: Option<&str>,
         _keystore: &mut D,
         _tpm: &mut tpm::provider::BoxedDynTpm,
         _machine_key: &tpm::structures::StorageKey,
@@ -253,7 +300,9 @@ pub trait IdProvider {
         &self,
         _account_id: &str,
         _token: Option<&UserToken>,
+        _service: &str,
         _no_hello_pin: bool,
+        _force_reauth: bool,
         _keystore: &mut D,
         _tpm: &mut tpm::provider::BoxedDynTpm,
         _machine_key: &tpm::structures::StorageKey,
@@ -327,4 +376,15 @@ pub trait IdProvider {
     ) -> CacheState;
 
     async fn offline_break_glass(&self, _ttl: Option<u64>) -> Result<(), IdpError>;
+
+    /// Export broker PRTs as a serialised blob (for fdstore persistence).
+    /// Providers that don't hold broker PRTs return an empty JSON object.
+    async fn export_broker_prts(&self) -> Result<Vec<u8>, serde_json::Error> {
+        Ok(b"{}".to_vec())
+    }
+
+    /// Import broker PRTs previously exported by [`Self::export_broker_prts`].
+    async fn import_broker_prts(&self, _data: &[u8]) -> Result<(), serde_json::Error> {
+        Ok(())
+    }
 }

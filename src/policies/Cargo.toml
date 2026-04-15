@@ -20,13 +20,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-regex = "^1.12.2"
+regex = "^1.12.3"
 base64.workspace = true
 tokio.workspace = true
 himmelblau_unix_common = { workspace = true }
 os-release = "0.1.0"
-semver = "1.0.27"
+semver = "1.0.28"
 libhimmelblau.workspace = true
 uuid.workspace = true
 libc.workspace = true
-tempfile = "3.23.0"
+tempfile = "3.27.0"

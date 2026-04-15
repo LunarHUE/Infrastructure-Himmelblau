@@ -9,6 +9,7 @@
  */
 
 use libc::uid_t;
+use libkrimes::proto::KerberosCredentials;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -36,6 +37,10 @@ pub enum PamAuthResponse {
     Password,
     /// PAM must prompt for an authentication code
     MFACode {
+        msg: String,
+    },
+    /// PAM must prompt for a TOTP code
+    HelloTOTP {
         msg: String,
     },
     /// PAM will poll for an external response
@@ -70,6 +75,7 @@ pub enum PamAuthResponse {
 pub enum PamAuthRequest {
     Password { cred: String },
     MFACode { cred: String },
+    HelloTOTP { cred: String },
     MFAPoll { poll_attempt: u32 },
     SetupPin { pin: String },
     Pin { cred: String },
@@ -84,11 +90,13 @@ pub enum ClientRequest {
     NssGroups,
     NssGroupByGid(u32),
     NssGroupByName(String),
-    PamAuthenticateInit(String, String, bool),
+    NssInitgroups(String),
+    PamAuthenticateInit(String, String, bool, bool),
     PamAuthenticateStep(PamAuthRequest),
     PamAccountAllowed(String),
     PamAccountBeginSession(String),
     PamChangeAuthToken(String, String, String, String),
+    PamTryUnseal(String, String),
     InvalidateCache,
     ClearCache,
     OfflineBreakGlass(Option<u64>),
@@ -105,10 +113,11 @@ impl ClientRequest {
             ClientRequest::NssGroups => "NssGroups".to_string(),
             ClientRequest::NssGroupByGid(id) => format!("NssGroupByGid({})", id),
             ClientRequest::NssGroupByName(id) => format!("NssGroupByName({})", id),
-            ClientRequest::PamAuthenticateInit(id, service, no_hello_pin) => {
+            ClientRequest::NssInitgroups(id) => format!("NssInitgroups({})", id),
+            ClientRequest::PamAuthenticateInit(id, service, no_hello_pin, force_reauth) => {
                 format!(
-                    "PamAuthenticateInit({}, {}, no_hello_pin: {})",
-                    id, service, no_hello_pin
+                    "PamAuthenticateInit({}, {}, no_hello_pin: {}, force_reauth: {})",
+                    id, service, no_hello_pin, force_reauth
                 )
             }
             ClientRequest::PamAuthenticateStep(_) => "PamAuthenticateStep".to_string(),
@@ -118,6 +127,9 @@ impl ClientRequest {
             ClientRequest::PamAccountBeginSession(_) => "PamAccountBeginSession".to_string(),
             ClientRequest::PamChangeAuthToken(id, _, _, _) => {
                 format!("PamChangeAuthToken({}, ...)", id)
+            }
+            ClientRequest::PamTryUnseal(id, _) => {
+                format!("PamTryUnseal({})", id)
             }
             ClientRequest::InvalidateCache => "InvalidateCache".to_string(),
             ClientRequest::ClearCache => "ClearCache".to_string(),
@@ -133,6 +145,7 @@ pub enum ClientResponse {
     NssAccount(Option<NssUser>),
     NssGroups(Vec<NssGroup>),
     NssGroup(Option<NssGroup>),
+    NssInitgroups(Option<Vec<u32>>),
 
     PamStatus(Option<bool>),
     PamAuthenticateStepResponse(PamAuthResponse),
@@ -160,9 +173,18 @@ pub enum TaskRequest {
     HomeDirectory(HomeDirectoryInfo),
     LocalGroups(String, bool),
     LogonScript(String, String),
-    KerberosCCache(uid_t, uid_t, Vec<u8>, Vec<u8>),
+    KerberosConfig(Option<String>, Option<String>),
+    KerberosTGTs(
+        uid_t,
+        uid_t,
+        Option<Box<KerberosCredentials>>,
+        Option<Box<KerberosCredentials>>,
+    ),
     LoadProfilePhoto(String, String),
     ApplyPolicy(Option<String>, String, String, String, String),
+    /// Set up subordinate UID/GID mappings for container support (podman, etc.)
+    /// Parameters: (username, subid_start, subid_count)
+    SubordinateIds(String, u32, u32),
 }
 
 impl TaskRequest {
@@ -172,12 +194,16 @@ impl TaskRequest {
             TaskRequest::HomeDirectory(_) => "HomeDirectory(...)".to_string(),
             TaskRequest::LocalGroups(_, _) => "LocalGroups(...)".to_string(),
             TaskRequest::LogonScript(_, _) => "LogonScript(...)".to_string(),
-            TaskRequest::KerberosCCache(uid, gid, _, _) => {
-                format!("KerberosCCache({}, {}, ...)", uid, gid)
+            TaskRequest::KerberosConfig(..) => "KerberosConfig(...)".to_string(),
+            TaskRequest::KerberosTGTs(uid, gid, _, _) => {
+                format!("KerberosTGTs({}, {}, ...)", uid, gid)
             }
             TaskRequest::LoadProfilePhoto(_, _) => "LoadProfilePhoto(...)".to_string(),
             TaskRequest::ApplyPolicy(intune_device_id, _, _, _, _) => {
                 format!("ApplyPolicy({:?}, ...)", intune_device_id)
+            }
+            TaskRequest::SubordinateIds(username, start, count) => {
+                format!("SubordinateIds({}, {}, {})", username, start, count)
             }
         }
     }
@@ -194,5 +220,16 @@ fn test_clientrequest_as_safe_string() {
     assert_eq!(
         ClientRequest::NssAccounts.as_safe_string(),
         "NssAccounts".to_string()
+    );
+
+    let safe = ClientRequest::PamTryUnseal(
+        "user@example.com".to_string(),
+        "s3cret-pin".to_string(),
+    )
+    .as_safe_string();
+    assert!(
+        !safe.contains("s3cret-pin"),
+        "as_safe_string() must not leak credentials: {}",
+        safe
     );
 }

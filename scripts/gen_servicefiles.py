@@ -24,6 +24,7 @@ MINVER = {
     # Unit section
     "Upholds": 249,
     # Service section
+    "FileDescriptorStorePreserve": 254,
     "TypeNotifyReload": 253,   # Use Type=notify-reload when >= this; else Type=notify
     "DynamicUser": 235,
     "ProtectSystemStrict": 214,
@@ -42,6 +43,7 @@ MINVER = {
     "CacheRuntimeStateDirs": 235,  # CacheDirectory/RuntimeDirectory/StateDirectory
     "ConditionPathExists": 12,
     "LoadCredentialEncrypted": 250,
+    "FileDescriptorStoreMax": 234,
     "StartLimitIntervalSec": 229,
     "StartLimitBurst": 229,
 }
@@ -90,7 +92,7 @@ def main():
 
     # systemd version
     if args.assume_version is not None:
-        ver = args.assume-version
+        ver = args.assume_version
     else:
         ver = detect_systemd_version()
     if ver is None:
@@ -136,7 +138,6 @@ def main():
         dirs_block.extend([
             "UMask=0027",
             "CacheDirectory=himmelblaud",
-            "RuntimeDirectory=himmelblaud",
             "StateDirectory=himmelblaud",
         ])
 
@@ -185,6 +186,13 @@ def main():
     if not args.disable_upholds and supported("Upholds"):
         upholds_line = "Upholds=himmelblaud-tasks.service"
 
+    # HSM PIN init service dependency (only if LoadCredentialEncrypted is supported)
+    hsm_pin_init_after = ""
+    hsm_pin_init_wants = ""
+    if supported("LoadCredentialEncrypted"):
+        hsm_pin_init_after = "himmelblau-hsm-pin-init.service"
+        hsm_pin_init_wants = "Wants=himmelblau-hsm-pin-init.service"
+
     # ---- Compose himmelblaud.service ----
     daemon_private_devices = "PrivateDevices=false" if supported("PrivateDevices") else ""
     daemon_hardening = [h for h in hardening if h != "ProtectSystem=strict"] + ["ProtectSystem=strict"] if supported("ProtectSystemStrict") else [h for h in hardening if h != "ProtectSystem=strict"]
@@ -206,14 +214,15 @@ def main():
 
 [Unit]
 Description=Himmelblau Authentication Daemon
-After={' '.join(base_after)}
+After={' '.join(base_after)}{' ' + hsm_pin_init_after if hsm_pin_init_after else ''}
 Before={' '.join(base_before)}
 Wants={' '.join(base_wants)}
+{hsm_pin_init_wants}
 # While it seems confusing, we need to be after nscd.service so that the
 # Conflicts will trigger and then automatically stop it.
 Conflicts=nscd.service
 # `Upholds` like a `Wants` directive ensures that himmelblaud-tasks is started but also
-# ensures it's kept running. This allows for a repeatable & fast way of starting 
+# ensures it's kept running. This allows for a repeatable & fast way of starting
 # himmelblaud-tasks at the right time.
 {upholds_line if upholds_line else ''}
 {'StartLimitIntervalSec=30s' if supported('StartLimitIntervalSec') else ''}
@@ -229,6 +238,9 @@ Conflicts=nscd.service
 ExecStart=/usr/sbin/himmelblaud
 Restart=on-failure
 RestartSec=500ms
+WatchdogSec=120s
+{'FileDescriptorStoreMax=1' if supported('FileDescriptorStoreMax') else ''}
+{'FileDescriptorStorePreserve=yes' if supported('FileDescriptorStorePreserve') else ''}
 
 {daemon_rw_paths_comment}
 
@@ -256,14 +268,10 @@ WantedBy=multi-user.target
 
 [Unit]
 Description=Himmelblau Local Tasks
-After={' '.join(tasks_after)} himmelblaud.service
-Requires=himmelblaud.service
+After={' '.join(tasks_after)}
+After=himmelblaud-tasks.socket
+Wants=himmelblaud-tasks.socket
 
-# This prevents starting himmelblaud-tasks before himmelblaud is running and
-# has created the socket necessary for communication.
-# We need the check so that fs namespacing used by `ReadWritePaths` has a
-# strict enough target to namespace. Without the check it fails in a more confusing way.
-{'ConditionPathExists=/run/himmelblaud/task_sock' if supported('ConditionPathExists') else ''}
 {'StartLimitIntervalSec=30s' if supported('StartLimitIntervalSec') else ''}
 {'StartLimitBurst=8' if supported('StartLimitBurst') else ''}
 
@@ -273,8 +281,11 @@ Type=notify
 ExecStart=/usr/sbin/himmelblaud_tasks
 Restart=on-failure
 RestartSec=1s
+WatchdogSec=120s
 
-CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+CacheDirectory=nss-himmelblau
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_SETUID CAP_SETGID
 # SystemCallFilter=@aio @basic-io @chown @file-system @io-event @network-io @sync
 { 'ProtectSystem=strict' if supported('ProtectSystemStrict') else '' }
 {rw_line}
@@ -285,6 +296,33 @@ CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 WantedBy=multi-user.target
 """.rstrip() + "\n"
 
+    # ---- Compose himmelblau-hsm-pin-init.service ----
+    # Always generate this file so cargo-deb can find it. On older systemd without
+    # LoadCredentialEncrypted support, the service won't be started by himmelblaud.service.
+    hsm_pin_init_unit = """\
+# You should not need to edit this file. Instead, use a drop-in file:
+#   systemctl edit himmelblau-hsm-pin-init.service
+
+[Unit]
+Description=Himmelblau HSM PIN Initialization
+Before=himmelblaud.service
+DefaultDependencies=no
+# systemd-tpm2-setup.service provisions the TPM Storage Root Key (SRK) at
+# 0x81000001. Without it, systemd-creds encrypt --tpm2-device=auto silently
+# falls back to a non-TPM-bound host key, so the HSM PIN is not TPM-protected.
+# Wants= (not Requires=) so we degrade gracefully on TPM-less systems.
+After=local-fs.target systemd-tpm2-setup.service
+Wants=systemd-tpm2-setup.service
+ConditionPathExists=!/var/lib/private/himmelblaud/hsm-pin.enc
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/himmelblau-init-hsm-pin
+
+[Install]
+WantedBy=himmelblaud.service
+"""
+
     # Clean extra blank lines from optional inserts
     def squeeze_blank_lines(s: str) -> str:
         s = re.sub(r"\n{3,}", "\n\n", s)
@@ -294,13 +332,16 @@ WantedBy=multi-user.target
 
     daemon_unit = squeeze_blank_lines(daemon_unit)
     tasks_unit  = squeeze_blank_lines(tasks_unit)
+    hsm_pin_init_unit = squeeze_blank_lines(hsm_pin_init_unit)
 
     (out_dir / "himmelblaud.service").write_text(daemon_unit)
     (out_dir / "himmelblaud-tasks.service").write_text(tasks_unit)
+    (out_dir / "himmelblau-hsm-pin-init.service").write_text(hsm_pin_init_unit)
 
     print(f"[gen-systemd] systemd version detected/assumed: {ver}")
     print(f"[gen-systemd] Wrote: {out_dir/'himmelblaud.service'}")
     print(f"[gen-systemd] Wrote: {out_dir/'himmelblaud-tasks.service'}")
+    print(f"[gen-systemd] Wrote: {out_dir/'himmelblau-hsm-pin-init.service'}")
 
 if __name__ == "__main__":
     main()

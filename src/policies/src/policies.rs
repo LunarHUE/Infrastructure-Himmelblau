@@ -21,7 +21,7 @@ use crate::custom_compliance_ext::CustomComplianceCSE;
 use crate::scripts_ext::ScriptsCSE;
 use anyhow::{anyhow, Result};
 use himmelblau::graph::Graph;
-use himmelblau::intune::{IntuneForLinux, IntuneStatus};
+use himmelblau::intune::{fetch_intune_portal_versions, IntuneForLinux, IntuneStatus};
 use himmelblau::{ClientInfo, EnrollAttrs, IdToken, UserToken};
 use himmelblau_unix_common::config::{split_username, HimmelblauConfig};
 use std::sync::Arc;
@@ -42,10 +42,7 @@ pub async fn apply_intune_policy(
 
     let domain = split_username(account_id)
         .map(|(_, domain)| domain)
-        .ok_or(anyhow!(
-            "Failed to parse domain name from account id '{}'",
-            account_id
-        ))?;
+        .ok_or(anyhow!("Failed to parse domain name from account id",))?;
 
     debug!(
         ?account_id,
@@ -63,7 +60,16 @@ pub async fn apply_intune_policy(
         .map_err(|e| anyhow!(e))?;
     debug!("Discovered Intune service endpoints");
 
-    let intune = IntuneForLinux::new(endpoints).map_err(|e| anyhow!(e))?;
+    let mut vers = fetch_intune_portal_versions(Some(
+        "https://packages.microsoft.com/ubuntu/22.04/prod/pool/main/i/intune-portal/",
+    ))
+    .await
+    .unwrap_or(vec!["1.2511.11".to_string()]);
+    if vers.is_empty() {
+        vers = vec!["1.2511.11".to_string()];
+    }
+    let intune =
+        IntuneForLinux::new(endpoints, Some(&vers[vers.len() - 1])).map_err(|e| anyhow!(e))?;
 
     let token = UserToken {
         token_type: String::new(),
@@ -91,9 +97,25 @@ pub async fn apply_intune_policy(
         .policies(&token, intune_device_id)
         .await
         .map_err(|e| anyhow!(e))?;
-    debug!("Received policy enforcement actions:\n{:#?}", policies);
+    debug!(
+        num_policies = policies.len(),
+        "Received policy enforcement actions"
+    );
+    debug!("Policy details:\n{:#?}", policies);
     let mut statuses: IntuneStatus = policies.into();
     statuses.set_device_id(intune_device_id.to_string());
+    debug!(
+        num_statuses = statuses.policy_statuses.len(),
+        "Converted policies to status entries"
+    );
+    for status in &statuses.policy_statuses {
+        debug!(
+            policy_id = %status.policy_id,
+            num_details = status.details.len(),
+            detail_ids = ?status.details.iter().map(|d| d.setting_definition_item_id.as_str()).collect::<Vec<_>>(),
+            "Policy status entry"
+        );
+    }
 
     let gp_extensions: Vec<Arc<dyn CSE>> = vec![
         Arc::new(ScriptsCSE::new(config, account_id)),
@@ -102,10 +124,15 @@ pub async fn apply_intune_policy(
     ];
 
     let mut errors = vec![];
-    for ext in gp_extensions {
+    let ext_names = ["ScriptsCSE", "ComplianceCSE", "CustomComplianceCSE"];
+    for (ext, name) in gp_extensions.iter().zip(ext_names.iter()) {
+        debug!(cse = name, "Running CSE");
         match ext.process_group_policy(&mut statuses).await {
-            Ok(_) => {}
+            Ok(_) => {
+                debug!(cse = name, "CSE completed successfully");
+            }
             Err(e) => {
+                error!(cse = name, error = %e, "CSE failed");
                 errors.push(e);
             }
         }
@@ -113,7 +140,22 @@ pub async fn apply_intune_policy(
     debug!("Enforced Intune policy");
 
     // Report policy status
-    debug!("Reporting Intune policy status:\n{:#?}", statuses);
+    debug!("Reporting Intune policy status");
+    for status in &statuses.policy_statuses {
+        for detail in &status.details {
+            debug!(
+                policy_id = %status.policy_id,
+                rule_id = %detail.rule_id,
+                setting_id = %detail.setting_definition_item_id,
+                expected = %detail.expected_value,
+                actual_len = detail.actual_value.len(),
+                new_state = %detail.new_compliance_state,
+                old_state = %detail.old_compliance_state,
+                "Status detail being reported"
+            );
+        }
+    }
+    debug!("Full status report:\n{:#?}", statuses);
     intune
         .status(&token, statuses)
         .await

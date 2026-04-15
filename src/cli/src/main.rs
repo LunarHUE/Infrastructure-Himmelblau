@@ -44,13 +44,13 @@ use himmelblau_unix_common::client::call_daemon;
 use himmelblau_unix_common::config::{parse_ttl_to_seconds, split_username, HimmelblauConfig};
 use himmelblau_unix_common::constants::{
     CONFIDENTIAL_CLIENT_CERT_KEY_TAG, CONFIDENTIAL_CLIENT_CERT_TAG, CONFIDENTIAL_CLIENT_SECRET_TAG,
-    DEFAULT_CONFIG_PATH, DEFAULT_HSM_PIN_PATH_ENC, DEFAULT_ODC_PROVIDER, ID_MAP_CACHE,
-    MAPPED_NAME_CACHE, NSS_CACHE,
+    DEFAULT_APP_ID, DEFAULT_CONFIG_PATH, DEFAULT_HSM_PIN_PATH_ENC, DEFAULT_ODC_PROVIDER,
+    EDGE_BROWSER_CLIENT_ID, ID_MAP_CACHE, MAPPED_NAME_CACHE, NSS_CACHE,
 };
 use himmelblau_unix_common::db::{Cache, CacheTxn, Db, KeyStoreTxn};
 use himmelblau_unix_common::idmap_cache::{StaticGroup, StaticIdCache, StaticUser};
 use himmelblau_unix_common::pam::{Options, PamResultCode};
-use himmelblau_unix_common::tpm::confidential_client_creds;
+use himmelblau_unix_common::tpm::{confidential_client_creds, open_tpm};
 use himmelblau_unix_common::tpm_init;
 use himmelblau_unix_common::unix_config::HsmType;
 use himmelblau_unix_common::unix_proto::{ClientRequest, ClientResponse};
@@ -92,8 +92,6 @@ struct Account {
     username: String,
 }
 
-const EDGE_BROWSER_CLIENT_ID: &str = "d7b530a4-7680-4c23-a8bf-c52c121d2e87";
-
 #[derive(Debug, Deserialize)]
 struct BrokerTokenResponse {
     #[serde(rename = "accessToken")]
@@ -117,7 +115,29 @@ fn insert_module_line(
     let original = std::fs::read_to_string(pam_file)?;
     let mut lines: Vec<String> = original.lines().map(|l| l.to_string()).collect();
 
-    if lines.iter().any(|l| l.contains("pam_himmelblau.so")) {
+    // Extract the options that follow "pam_himmelblau.so" in the desired module_line.
+    let desired_opts: std::collections::HashSet<&str> = module_line
+        .split("pam_himmelblau.so")
+        .nth(1)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect();
+    let stack_type = module_line.split_whitespace().next().unwrap_or("");
+
+    if lines.iter().any(|l| {
+        if !l.contains("pam_himmelblau.so")
+            || !l.trim_start().starts_with(stack_type)
+        {
+            return false;
+        }
+        let existing_opts: std::collections::HashSet<&str> = l
+            .split("pam_himmelblau.so")
+            .nth(1)
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        existing_opts == desired_opts
+    }) {
         debug!("{} already contains pam_himmelblau; skipping", pam_file);
         return Ok(());
     }
@@ -163,60 +183,177 @@ fn insert_module_line(
 }
 
 #[instrument]
+fn detect_pam_files(
+    explicit: Option<&str>,
+    candidates: &[&str],
+    role: &str,
+) -> anyhow::Result<Vec<String>> {
+    if let Some(path) = explicit {
+        return Ok(vec![path.to_owned()]);
+    }
+
+    let mut found: Vec<String> = candidates
+        .iter()
+        .map(|p| p.to_string())
+        .filter(|p| Path::new(p).exists())
+        .collect();
+
+    // Deduplicate in case the same file shows up more than once
+    found.sort();
+    found.dedup();
+
+    if found.is_empty() {
+        anyhow::bail!(
+            "Could not find any PAM configuration file for {}. \
+             Tried: {}. Consider using --auth-file/--account-file/--session-file/--password-file.",
+            role,
+            candidates.join(", "),
+        );
+    }
+
+    Ok(found)
+}
+
+#[instrument]
 fn configure_pam(
     dry_run: bool,
     auth_file: Option<&str>,
     account_file: Option<&str>,
     session_file: Option<&str>,
     password_file: Option<&str>,
+    try_unseal: bool,
 ) -> anyhow::Result<()> {
-    let auth_file = auth_file.unwrap_or("/etc/pam.d/common-auth");
-    let account_file = account_file.unwrap_or("/etc/pam.d/common-account");
-    let session_file = session_file.unwrap_or("/etc/pam.d/common-session");
-    let password_file = password_file.unwrap_or("/etc/pam.d/common-password");
-
-    insert_module_line(
+    let auth_files = detect_pam_files(
         auth_file,
-        "auth\tsufficient\tpam_himmelblau.so ignore_unknown_user",
-        Some(&|l: &str| l.contains("pam_localuser.so")),
-        Some(&|l: &str| l.contains("pam_unix.so") && l.contains("auth")),
-        dry_run,
+        &[
+            "/etc/pam.d/common-auth",
+            "/etc/pam.d/system-auth",
+            "/etc/pam.d/password-auth",
+            "/etc/pam.d/system-login",
+        ],
+        "auth",
     )?;
 
-    insert_module_line(
+    let account_files = detect_pam_files(
         account_file,
-        "account\tsufficient\tpam_himmelblau.so ignore_unknown_user",
-        None,
-        Some(&|l: &str| l.contains("pam_unix.so") && l.contains("account")),
-        dry_run,
+        &[
+            "/etc/pam.d/common-account",
+            "/etc/pam.d/system-auth",
+            "/etc/pam.d/password-auth",
+            "/etc/pam.d/system-login",
+        ],
+        "account",
     )?;
 
-    insert_module_line(
+    let session_files = detect_pam_files(
         session_file,
-        "session\toptional\tpam_himmelblau.so",
-        None,
-        None,
-        dry_run,
+        &[
+            "/etc/pam.d/common-session",
+            "/etc/pam.d/system-auth",
+            "/etc/pam.d/password-auth",
+            "/etc/pam.d/system-login",
+        ],
+        "session",
     )?;
 
-    insert_module_line(
+    let password_files = detect_pam_files(
         password_file,
-        "password\tsufficient\tpam_himmelblau.so ignore_unknown_user",
-        None,
-        Some(&|l: &str| {
-            l.contains("pam_unix.so") && l.contains("password")
-                || l.contains("pam_cracklib.so") && l.contains("password")
-                || l.contains("pam_pwquality.so") && l.contains("password")
-        }),
-        dry_run,
+        &[
+            "/etc/pam.d/common-password",
+            "/etc/pam.d/system-auth",
+            "/etc/pam.d/password-auth",
+            "/etc/pam.d/system-login",
+        ],
+        "password",
     )?;
+
+    // AUTH
+    for auth_file in &auth_files {
+        if try_unseal {
+            // --try-unseal: only add the optional try_unseal line, nothing else
+            insert_module_line(
+                auth_file,
+                "auth\toptional\tpam_himmelblau.so try_unseal",
+                None,
+                None,
+                dry_run,
+            )?;
+        } else {
+            insert_module_line(
+                auth_file,
+                // Set PAM_AUTHTOK from Hello PIN so downstream modules (e.g. gnome-keyring)
+                // can unlock using use_authtok.
+                "auth\tsufficient\tpam_himmelblau.so ignore_unknown_user set_authtok",
+                None,
+                // pam_himmelblau should always come first on the auth stack
+                Some(&|_: &str| true),
+                dry_run,
+            )?;
+        }
+    }
+
+    if try_unseal {
+        return Ok(());
+    }
+
+    // ACCOUNT
+    for account_file in &account_files {
+        insert_module_line(
+            account_file,
+            "account\tsufficient\tpam_himmelblau.so ignore_unknown_user",
+            None,
+            Some(&|l: &str| {
+                (l.contains("pam_unix.so") && l.contains("account"))
+                    || (l.contains("pam_faillock.so") && l.contains("account"))
+            }),
+            dry_run,
+        )?;
+    }
+
+    // SESSION
+    for session_file in &session_files {
+        insert_module_line(
+            session_file,
+            "session\toptional\tpam_himmelblau.so",
+            None,
+            None,
+            dry_run,
+        )?;
+    }
+
+    // PASSWORD
+    for password_file in &password_files {
+        insert_module_line(
+            password_file,
+            "password\tsufficient\tpam_himmelblau.so ignore_unknown_user set_authtok",
+            None,
+            Some(&|l: &str| {
+                (l.contains("pam_unix.so") && l.contains("password"))
+                    || (l.contains("pam_cracklib.so") && l.contains("password"))
+                    || (l.contains("pam_pwquality.so") && l.contains("password"))
+            }),
+            dry_run,
+        )?;
+    }
 
     Ok(())
 }
 
 #[instrument(skip(app, account_id))]
 async fn auth(app: &BrokerClientApplication, account_id: &str) -> Option<UserToken> {
-    let auth_options = vec![AuthOption::Passwordless];
+    let config = match HimmelblauConfig::new(Some(DEFAULT_CONFIG_PATH)) {
+        Ok(cfg) => Some(cfg),
+        Err(e) => {
+            warn!(?e, "Failed to read config, using defaults");
+            None
+        }
+    };
+    let enable_passwordless = config.as_ref().map(|c| c.get_enable_passwordless()).unwrap_or(true);
+    let auth_options = if enable_passwordless {
+        vec![AuthOption::Passwordless]
+    } else {
+        vec![]
+    };
     let auth_init = match app.check_user_exists(account_id, &auth_options).await {
         Ok(auth_init) => auth_init,
         Err(e) => {
@@ -244,11 +381,7 @@ async fn auth(app: &BrokerClientApplication, account_id: &str) -> Option<UserTok
         None
     };
 
-    let mfa_method = if let Ok(cfg) = HimmelblauConfig::new(Some(DEFAULT_CONFIG_PATH)) {
-        cfg.get_mfa_method()
-    } else {
-        None
-    };
+    let mfa_method = config.as_ref().and_then(|c| c.get_mfa_method());
 
     let mut mfa_req = match app
         .initiate_acquire_token_by_mfa_flow_for_device_enrollment(
@@ -367,7 +500,7 @@ async fn auth(app: &BrokerClientApplication, account_id: &str) -> Option<UserTok
     Some(token)
 }
 
-#[instrument]
+#[instrument(skip(client_id, account_id, domain))]
 async fn confidential_client_access_token(
     client_id: Option<String>,
     account_id: Option<String>,
@@ -512,6 +645,7 @@ async fn main() -> ExitCode {
         HimmelblauUnixOpt::AuthTest {
             debug,
             account_id: _,
+            force_reauth: _,
         } => debug,
         HimmelblauUnixOpt::CacheClear {
             debug,
@@ -532,6 +666,7 @@ async fn main() -> ExitCode {
             account_file: _,
             session_file: _,
             password_file: _,
+            try_unseal: _,
         } => debug,
         HimmelblauUnixOpt::Enumerate {
             debug,
@@ -738,35 +873,44 @@ async fn main() -> ExitCode {
                 debug!("Attempting SSO Broker auth ...");
                 if let Ok(broker) = BrokerClient::new().await {
                     let session_id = Uuid::new_v4().to_string();
-                    let client_id = $client_id.unwrap_or(EDGE_BROWSER_CLIENT_ID.to_string());
-                    if let Ok(account_val) = broker.get_accounts(
-                        "0.0", &session_id,
-                        &json!({"clientId": client_id.clone(), "redirectUri": session_id.clone()})
-                    ).await {
-                        if let Ok(accounts) = serde_json::from_value::<Accounts>(account_val) {
-                            if let Some(account) = accounts.accounts.into_iter().next() {
-                                if let Ok(Account { username, .. }) = serde_json::from_value::<Account>(account.clone()) {
-                                    if $account_id.is_none() || $account_id.clone().map(|s| s.to_lowercase()).as_ref().unwrap_or(&"".to_string()) == &username.to_lowercase() {
-                                        if let Ok(cfg) = HimmelblauConfig::new(Some(DEFAULT_CONFIG_PATH)) {
-                                            let (graph, _, authority) = init!(cfg, Some(username), None);
-                                            if let Ok(token_val) = broker.acquire_token_silently(
-                                                "0.0", &session_id,
-                                                &json!({
-                                                    "account": account,
-                                                    "authParameters": {
+                    let client_ids_to_try: Vec<String> = match &$client_id {
+                        Some(cid) => vec![cid.clone()],
+                        None => vec![
+                            EDGE_BROWSER_CLIENT_ID.to_string(),
+                            DEFAULT_APP_ID.to_string(),
+                        ],
+                    };
+                    for client_id in client_ids_to_try {
+                        if result.is_some() { break; }
+                        if let Ok(account_val) = broker.get_accounts(
+                            "0.0", &session_id,
+                            &json!({"clientId": client_id.clone(), "redirectUri": session_id.clone()})
+                        ).await {
+                            if let Ok(accounts) = serde_json::from_value::<Accounts>(account_val) {
+                                if let Some(account) = accounts.accounts.into_iter().next() {
+                                    if let Ok(Account { username, .. }) = serde_json::from_value::<Account>(account.clone()) {
+                                        if $account_id.is_none() || $account_id.clone().map(|s| s.to_lowercase()).as_ref().unwrap_or(&"".to_string()) == &username.to_lowercase() {
+                                            if let Ok(cfg) = HimmelblauConfig::new(Some(DEFAULT_CONFIG_PATH)) {
+                                                let (graph, _, authority) = init!(cfg, Some(username), None);
+                                                if let Ok(token_val) = broker.acquire_token_silently(
+                                                    "0.0", &session_id,
+                                                    &json!({
                                                         "account": account,
-                                                        "additionalQueryParametersForAuthorization": {},
-                                                        "authority": authority,
-                                                        "authorizationType": 8,
-                                                        "clientId": client_id,
-                                                        "redirectUri": "https://login.microsoftonline.com/common/oauth2/nativeclient",
-                                                        "requestedScopes": $scopes,
-                                                        "ssoUrl": "https://login.microsoftonline.com/"
+                                                        "authParameters": {
+                                                            "account": account,
+                                                            "additionalQueryParametersForAuthorization": {},
+                                                            "authority": authority,
+                                                            "authorizationType": 8,
+                                                            "clientId": client_id,
+                                                            "redirectUri": "https://login.microsoftonline.com/common/oauth2/nativeclient",
+                                                            "requestedScopes": $scopes,
+                                                            "ssoUrl": "https://login.microsoftonline.com/"
+                                                        }
+                                                    })
+                                                ).await {
+                                                    if let Ok(token) = serde_json::from_value::<Token>(token_val) {
+                                                        result = Some((graph, token.response.access_token));
                                                     }
-                                                })
-                                            ).await {
-                                                if let Ok(token) = serde_json::from_value::<Token>(token_val) {
-                                                    result = Some((graph, token.response.access_token));
                                                 }
                                             }
                                         }
@@ -1403,6 +1547,7 @@ async fn main() -> ExitCode {
         HimmelblauUnixOpt::AuthTest {
             debug: _,
             account_id,
+            force_reauth,
         } => {
             debug!("Starting PAM auth tester tool ...");
 
@@ -1417,7 +1562,8 @@ async fn main() -> ExitCode {
             // Map the name
             let account_id = cfg.map_name_to_upn(&account_id);
 
-            let opts = Options::default();
+            let mut opts = Options::default();
+            opts.force_reauth = force_reauth;
             let msg_printer = Arc::new(SimpleMessagePrinter::default());
             match authenticate_async(
                 None,
@@ -1510,13 +1656,16 @@ async fn main() -> ExitCode {
 
                 match call_daemon(&cfg.get_socket_path(), req, cfg.get_unix_sock_timeout()).await {
                     Ok(r) => match r {
-                        ClientResponse::Ok => info!("success"),
+                        ClientResponse::Ok => {}
                         _ => {
                             error!("Error: unexpected response -> {:?}", r);
+                            return ExitCode::FAILURE;
                         }
                     },
                     Err(e) => {
                         error!("Error -> {:?}", e);
+                        error!("Is himmelblaud running? Cache was NOT cleared.");
+                        return ExitCode::FAILURE;
                     }
                 };
 
@@ -1560,6 +1709,7 @@ async fn main() -> ExitCode {
             account_file,
             session_file,
             password_file,
+            try_unseal,
         } => {
             trace!("Configuring pam_himmelblau ...");
             if really && unsafe { libc::geteuid() } != 0 {
@@ -1577,6 +1727,7 @@ async fn main() -> ExitCode {
                 account_file.as_deref(),
                 session_file.as_deref(),
                 password_file.as_deref(),
+                try_unseal,
             ) {
                 Ok(_) => ExitCode::SUCCESS,
                 _ => ExitCode::FAILURE,
@@ -1588,6 +1739,10 @@ async fn main() -> ExitCode {
             client_id,
         } => {
             debug!("Starting enumerate tool ...");
+            if unsafe { libc::geteuid() } != 0 {
+                error!("This command must be run as root.");
+                return ExitCode::FAILURE;
+            }
 
             let (graph, access_token) = match obtain_access_token!(
                 account_id,
@@ -1962,36 +2117,82 @@ async fn main() -> ExitCode {
 
             let tpm_present =
                 fs::metadata("/dev/tpmrm0").is_ok() || fs::metadata("/dev/tpm0").is_ok();
-            if tpm_present {
-                let cfg = match HimmelblauConfig::new(Some(DEFAULT_CONFIG_PATH)) {
-                    Ok(c) => c,
-                    Err(_e) => {
-                        error!("Failed to parse {}", DEFAULT_CONFIG_PATH);
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let unencrypted_pin_present = match PathBuf::from_str(&cfg.get_hsm_pin_path()) {
-                    Ok(path) => path.exists(),
-                    Err(_) => false,
-                };
-                let encrypted_pin_present = match PathBuf::from_str(DEFAULT_HSM_PIN_PATH_ENC) {
-                    Ok(path) => path.exists(),
-                    Err(_) => false,
-                };
-                if encrypted_pin_present && !unencrypted_pin_present {
-                    println!("Himmelblau TPM state: \x1b[32mTPM in use\x1b[0m")
-                } else {
-                    match cfg.get_hsm_type() {
-                        HsmType::Tpm | HsmType::TpmIfPossible => {
-                            println!("Himmelblau TPM state: \x1b[32mTPM in use\x1b[0m");
+
+            if !tpm_present {
+                println!("Himmelblau TPM state: \x1b[31mNo TPM detected\x1b[0m");
+                return ExitCode::SUCCESS;
+            }
+
+            let cfg = match HimmelblauConfig::new(Some(DEFAULT_CONFIG_PATH)) {
+                Ok(c) => c,
+                Err(_e) => {
+                    error!("Failed to parse {}", DEFAULT_CONFIG_PATH);
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            // Check whether the HSM PIN credential is TPM-bound via systemd-creds.
+            // This is reliable evidence of TPM involvement regardless of hsm_type.
+            let unencrypted_pin_present = match PathBuf::from_str(&cfg.get_hsm_pin_path()) {
+                Ok(path) => path.exists(),
+                Err(_) => false,
+            };
+            let encrypted_pin_present = match PathBuf::from_str(DEFAULT_HSM_PIN_PATH_ENC) {
+                Ok(path) => path.exists(),
+                Err(_) => false,
+            };
+            let pin_tpm_bound = encrypted_pin_present && !unencrypted_pin_present;
+
+            // Actually attempt to open the hardware TPM to verify it is reachable
+            // and the compiled binary has the tpm feature enabled. Reading the
+            // config string alone is not sufficient — it may say "tpm" while the
+            // daemon silently fell back to SoftTpm (e.g. after a Soft→TPM migration
+            // without clearing HSM key material, or on a system where the SRK has
+            // not been provisioned).
+            let hw_tpm_opened = open_tpm(&cfg.get_tpm_tcti_name()).is_some();
+
+            match cfg.get_hsm_type() {
+                HsmType::Tpm | HsmType::TpmIfPossible => {
+                    if hw_tpm_opened {
+                        if pin_tpm_bound {
+                            println!(
+                                "Himmelblau TPM state: \x1b[32mTPM in use\x1b[0m \
+                                 (HSM PIN is TPM-bound via systemd-creds)"
+                            );
+                        } else {
+                            println!(
+                                "Himmelblau TPM state: \x1b[33mTPM configured and reachable, \
+                                 but HSM PIN is NOT TPM-bound\x1b[0m"
+                            );
+                            println!(
+                                "  Hint: re-run himmelblau-hsm-pin-init after ensuring \
+                                 systemd-tpm2-setup.service has run, or check dmesg for TPM errors."
+                            );
                         }
-                        HsmType::Soft => {
-                            println!("Himmelblau TPM state: \x1b[31mTPM not in use\x1b[0m");
-                        }
+                    } else {
+                        println!(
+                            "Himmelblau TPM state: \x1b[31mTPM configured but NOT reachable\x1b[0m"
+                        );
+                        println!(
+                            "  hsm_type = {} in config, but opening the TPM device failed.",
+                            cfg.get_hsm_type()
+                        );
+                        println!(
+                            "  The daemon may be running in SoftTpm fallback mode. \
+                             Check that the tpm feature was compiled in and /dev/tpmrm0 is accessible."
+                        );
                     }
                 }
-            } else {
-                println!("Himmelblau TPM state: \x1b[31mNo TPM detected\x1b[0m");
+                HsmType::Soft => {
+                    if pin_tpm_bound {
+                        println!(
+                            "Himmelblau TPM state: \x1b[33mSoft HSM, but HSM PIN is TPM-bound \
+                             via systemd-creds\x1b[0m"
+                        );
+                    } else {
+                        println!("Himmelblau TPM state: \x1b[31mTPM not in use\x1b[0m");
+                    }
+                }
             }
 
             ExitCode::SUCCESS

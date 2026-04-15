@@ -46,14 +46,20 @@ pub const DEFAULT_SELINUX: bool = true;
 pub const DEFAULT_HSM_PIN_PATH: &str = "/var/lib/himmelblaud/hsm-pin";
 pub const DEFAULT_HSM_PIN_PATH_ENC: &str = "/var/lib/himmelblaud/hsm-pin.enc";
 pub const DEFAULT_HELLO_ENABLED: bool = true;
+pub const DEFAULT_ALLOW_REMOTE_HELLO: bool = false;
 pub const DEFAULT_SFA_FALLBACK_ENABLED: bool = false;
+pub const DEFAULT_CONSOLE_PASSWORD_ONLY: bool = true;
+// Remote access services that should always require MFA (not password-only).
+// These are substring patterns matched via contains(), so "ssh" matches "sshd", "openssh", etc.
+pub const DEFAULT_PASSWORD_ONLY_REMOTE_SERVICES_DENY_LIST: &str =
+    "ssh,telnet,ftp,rsh,rlogin,rexec,vnc,xrdp,cockpit,mosh";
 pub const DEFAULT_ID_ATTR_MAP: IdAttr = IdAttr::Name;
 pub const BROKER_APP_ID: &str = "29d9ed98-a469-4536-ade2-f981bc1d605e";
 pub const BROKER_CLIENT_IDENT: &str = "38aa3b87-a06d-4817-b275-7a316988d93b";
 pub const CN_NAME_MAPPING: bool = true;
 pub const DEFAULT_HELLO_PIN_MIN_LEN: usize = 6;
 pub const DEFAULT_HELLO_PIN_RETRY_COUNT: u32 = 3;
-pub const DEFAULT_CCACHE_DIR: &str = "/tmp/krb5cc_";
+pub const DEFAULT_KERBEROS_CONF_DIR: &str = "/etc/krb5.conf.d/";
 pub const EDGE_BROWSER_CLIENT_ID: &str = "d7b530a4-7680-4c23-a8bf-c52c121d2e87";
 pub const DEFAULT_TPM_TCTI_NAME: &str = "device:/dev/tpmrm0";
 pub const CONFIDENTIAL_CLIENT_CERT_KEY_TAG: &str = "confidential_client_certificate_key";
@@ -61,3 +67,5 @@ pub const CONFIDENTIAL_CLIENT_SECRET_TAG: &str = "confidential_client_secret";
 pub const CONFIDENTIAL_CLIENT_CERT_TAG: &str = "confidential_client_certificate";
 pub const DEFAULT_JOIN_TYPE: JoinType = JoinType::Join;
 pub const DEFAULT_OFFLINE_BREAKGLASS_TTL: u64 = 7200;
+pub const DEFAULT_FIDO_TIMEOUT: u64 = 25;
+pub const DEFAULT_HELLO_TOTP_ENABLED: bool = false;

@@ -24,6 +24,7 @@ use std::fs::metadata;
 use std::io;
 use std::io::{Error as IoError, ErrorKind};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -37,7 +38,7 @@ use himmelblau_unix_common::config::{split_username, HimmelblauConfig};
 use himmelblau_unix_common::constants::{DEFAULT_APP_ID, DEFAULT_CONFIG_PATH};
 use himmelblau_unix_common::db::{Cache, CacheTxn, Db};
 use himmelblau_unix_common::idprovider::himmelblau::HimmelblauMultiProvider;
-use himmelblau_unix_common::idprovider::interface::Id;
+use himmelblau_unix_common::idprovider::interface::{Id, IdProvider};
 use himmelblau_unix_common::resolver::{AuthSession, Resolver};
 use himmelblau_unix_common::unix_config::UidAttr;
 use himmelblau_unix_common::unix_passwd::{parse_etc_group, parse_etc_passwd};
@@ -46,6 +47,7 @@ use himmelblau_unix_common::unix_proto::{
 };
 use himmelblau_unix_common::user_map::UserMap;
 use himmelblau_unix_common::{tpm_init, tpm_loadable_machine_key, tpm_machine_key};
+use idmap::{gen_subid_start, SUBID_COUNT};
 use uuid::Uuid;
 
 use kanidm_utils_users::{get_current_gid, get_current_uid, get_effective_gid, get_effective_uid};
@@ -70,7 +72,9 @@ use notify_debouncer_full::{new_debouncer, notify::RecursiveMode};
 
 mod broker;
 use broker::Broker;
-use identity_dbus_broker::himmelblau_broker_serve;
+use identity_dbus_broker::himmelblau_broker_serve_with_listener;
+
+mod prt_memfd;
 
 //=== the codec
 
@@ -199,6 +203,12 @@ async fn handle_task_client(
                 // Ignore if it fails.
                 let _ = v.1.send(status);
             }
+            Some(Ok(TaskResponse::Error(msg))) => {
+                warn!("Task returned an error: {}", msg);
+                // Send a failure status back via the one-shot so the
+                // caller knows, but don't kill the task connection.
+                let _ = v.1.send(1);
+            }
             other => {
                 error!("Error -> {:?}", other);
                 return Err(Box::new(IoError::new(ErrorKind::Other, "oh no!")));
@@ -299,7 +309,19 @@ async fn handle_client(
                         ClientResponse::NssGroup(None)
                     })
             }
-            ClientRequest::PamAuthenticateInit(account_id, service, no_hello_pin) => {
+            ClientRequest::NssInitgroups(account_id) => {
+                let account_id = account_id.to_lowercase();
+                trace!("nssinitgroups req");
+                cachelayer
+                    .get_initgroups(account_id.as_str())
+                    .await
+                    .map(ClientResponse::NssInitgroups)
+                    .unwrap_or_else(|_| {
+                        error!("unable to load initgroups.");
+                        ClientResponse::Error
+                    })
+            }
+            ClientRequest::PamAuthenticateInit(account_id, service, no_hello_pin, force_reauth) => {
                 let account_id = account_id.to_lowercase();
                 let span = span!(Level::INFO, "pam authenticate init");
                 trace!("pam authenticate init");
@@ -312,6 +334,7 @@ async fn handle_client(
                             account_id.as_str(),
                             service.as_str(),
                             no_hello_pin,
+                            force_reauth,
                             shutdown_tx.subscribe(),
                         )
                         .await
@@ -356,6 +379,8 @@ async fn handle_client(
                                                                 Id::Name(account_id.to_string()),
                                                                 scopes,
                                                                 client_id,
+                                                                None,
+                                                                None,
                                                             )
                                                             .await
                                                         {
@@ -410,23 +435,61 @@ async fn handle_client(
                                                     }
 
                                                     // Initialize the user Kerberos ccache
-                                                    if let Some((uid, gid, cloud_ccache, ad_ccache)) =
+                                                    if let Some((uid, gid, tgt_cloud, tgt_ad, top_level_names, tenant_id)) =
                                                         cachelayer
-                                                            .get_user_ccaches(Id::Name(
+                                                            .get_user_tgts(Id::Name(
                                                                 account_id.to_string(),
                                                             ))
                                                             .await
                                                     {
                                                         let (tx, rx) = oneshot::channel();
+                                                        match task_channel_tx
+                                                            .send_timeout(
+                                                                (
+                                                                    TaskRequest::KerberosConfig(top_level_names, tenant_id),
+                                                                    tx,
+                                                                ),
+                                                                Duration::from_millis(100),
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(()) => {
+                                                                // Now wait for the other end OR timeout.
+                                                                match time::timeout_at(
+                                                                    time::Instant::now()
+                                                                        + Duration::from_secs(60),
+                                                                    rx,
+                                                                )
+                                                                .await
+                                                                {
+                                                                    Ok(Ok(status)) => {
+                                                                        if status != 0 {
+                                                                            error!("Kerberos config failed for {}: Status code: {}", account_id, status);
+                                                                        }
+                                                                    }
+                                                                    Ok(Err(e)) => {
+                                                                        error!("Kerberos config failed for {}: {:?}", account_id, e);
+                                                                    }
+                                                                    Err(e) => {
+                                                                        error!("Kerberos config failed for {}: {:?}", account_id, e);
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                error!("Kerberos config failed for {}: {:?}", account_id, e);
+                                                            }
+                                                        }
+
+                                                        let (tx, rx) = oneshot::channel();
 
                                                         match task_channel_tx
                                                             .send_timeout(
                                                                 (
-                                                                    TaskRequest::KerberosCCache(
+                                                                    TaskRequest::KerberosTGTs(
                                                                         uid,
                                                                         gid,
-                                                                        cloud_ccache,
-                                                                        ad_ccache,
+                                                                        tgt_cloud,
+                                                                        tgt_ad,
                                                                     ),
                                                                     tx,
                                                                 ),
@@ -467,6 +530,8 @@ async fn handle_client(
                                                         .get_user_accesstoken(
                                                             Id::Name(account_id.to_string()),
                                                             vec![],
+                                                            None,
+                                                            None,
                                                             None,
                                                         )
                                                         .await
@@ -528,19 +593,25 @@ async fn handle_client(
                                                             .get_user_accesstoken(
                                                                 Id::Name(account_id.clone()),
                                                                 vec!["00000003-0000-0000-c000-000000000000/.default".to_string()],
-                                                                Some(DEFAULT_APP_ID.to_string())
+                                                                Some(DEFAULT_APP_ID.to_string()),
+                                                                None,
+                                                                None,
                                                             ).await;
                                                         let intune_token = cachelayer
                                                             .get_user_accesstoken(
                                                                 Id::Name(account_id.clone()),
                                                                 vec!["0000000a-0000-0000-c000-000000000000/.default".to_string()],
-                                                                Some(DEFAULT_APP_ID.to_string())
+                                                                Some(DEFAULT_APP_ID.to_string()),
+                                                                None,
+                                                                None,
                                                             ).await;
                                                         let iwservice_token = cachelayer
                                                             .get_user_accesstoken(
                                                                 Id::Name(account_id.clone()),
                                                                 vec!["b8066b99-6e67-41be-abfa-75db1a2c8809/.default".to_string()],
-                                                                Some(DEFAULT_APP_ID.to_string())
+                                                                Some(DEFAULT_APP_ID.to_string()),
+                                                                None,
+                                                                None,
                                                             ).await;
 
                                                         if let Some(graph_token) = graph_token {
@@ -740,6 +811,56 @@ async fn handle_client(
                                 }
                             };
 
+                            // Set up subordinate IDs for container support
+                            let subid_range = cfg.get_subid_range();
+                            let mapped_name = cfg.map_upn_to_name(&account_id);
+                            let subid_start = gen_subid_start(&mapped_name, subid_range);
+
+                            let (tx, rx) = oneshot::channel();
+
+                            let resp3 = match task_channel_tx
+                                .send_timeout(
+                                    (
+                                        TaskRequest::SubordinateIds(
+                                            mapped_name,
+                                            subid_start,
+                                            SUBID_COUNT,
+                                        ),
+                                        tx,
+                                    ),
+                                    Duration::from_millis(100),
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    // Now wait for the other end OR timeout.
+                                    match time::timeout_at(
+                                        time::Instant::now() + Duration::from_millis(1000),
+                                        rx,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(_)) => {
+                                            trace!("SubordinateIds task completed");
+                                            ClientResponse::Ok
+                                        }
+                                        _ => {
+                                            // Timeout or error - log but don't fail the session
+                                            debug!("SubordinateIds task timed out or failed");
+                                            ClientResponse::Ok
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Failed to submit - log but don't fail the session
+                                    debug!("Failed to submit SubordinateIds task: {:?}", e);
+                                    ClientResponse::Ok
+                                }
+                            };
+
+                            // Return error only if critical tasks (home dir or local groups) failed
+                            // SubordinateIds failure is non-critical
+                            let _ = resp3; // Acknowledge resp3 but don't affect the result
                             match resp1 {
                                 ClientResponse::Error => ClientResponse::Error,
                                 _ => resp2,
@@ -817,6 +938,30 @@ async fn handle_client(
                 } else {
                     ClientResponse::Error
                 }
+            }
+            ClientRequest::PamTryUnseal(account_id, cred) => {
+                let account_id = account_id.to_lowercase();
+                let span = span!(Level::INFO, "pam try unseal");
+                async {
+                    trace!("pam try unseal");
+                    match cachelayer
+                        .pam_try_unseal(&account_id, &cred)
+                        .await
+                    {
+                        Ok(true) => {
+                            debug!("pam_try_unseal: succeeded for {}", account_id);
+                        }
+                        Ok(false) => {
+                            debug!("pam_try_unseal: failed for {}", account_id);
+                        }
+                        Err(()) => {
+                            error!("pam_try_unseal: error for {}", account_id);
+                        }
+                    }
+                    ClientResponse::Ok
+                }
+                .instrument(span)
+                .await
             }
         };
         reqs.send(resp).await?;
@@ -949,9 +1094,6 @@ async fn main() -> ExitCode {
             )
         })
         .on(async {
-            let span = span!(Level::INFO, "initialisation");
-            let _enter = span.enter();
-
             if clap_args.get_flag("skip-root-check") {
                 warn!("Skipping root user check, if you're running this for testing, ensure you clean up temporary files.")
                 // TODO: this wording is not great m'kay.
@@ -1003,14 +1145,46 @@ async fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
 
+            // Validate that idmap_range and subid_range don't overlap
+            let subid_range = cfg.get_subid_range();
+            let idmap_range = cfg.get_idmap_range("_");
+
+            // Ranges overlap if one starts before the other ends
+            if idmap_range.0 <= subid_range.1 && subid_range.0 <= idmap_range.1 {
+                error!(
+                    "Configuration error: idmap_range ({}-{}) overlaps with subid_range ({}-{}). \
+                    These ranges must not overlap to prevent ID conflicts. \
+                    Please adjust your configuration.",
+                    idmap_range.0, idmap_range.1, subid_range.0, subid_range.1
+                );
+                return ExitCode::FAILURE;
+            }
+
+            info!(
+                "Subordinate ID support enabled with range {}-{}",
+                subid_range.0, subid_range.1
+            );
+
             let socket_path = cfg.get_socket_path();
             let task_socket_path = cfg.get_task_socket_path();
             let broker_socket_path = cfg.get_broker_socket_path();
 
-            debug!("🧹 Cleaning up sockets from previous invocations");
-            rm_if_exist(&socket_path);
-            rm_if_exist(&task_socket_path);
-            rm_if_exist(&broker_socket_path);
+            // Collect all file descriptors passed by systemd (socket
+            // activation + FD store) in one shot, before anything
+            // else consumes the LISTEN_* environment variables.
+            let mut systemd_fds = prt_memfd::collect_systemd_fds();
+
+            // Only clean up sockets that were NOT passed via socket
+            // activation, as those are owned by systemd.
+            if systemd_fds.main_socket.is_none() {
+                rm_if_exist(&socket_path);
+            }
+            if systemd_fds.task_socket.is_none() {
+                rm_if_exist(&task_socket_path);
+            }
+            if systemd_fds.broker_socket.is_none() {
+                rm_if_exist(&broker_socket_path);
+            }
 
 
             // Check the db path will be okay.
@@ -1154,6 +1328,17 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE
             }
 
+            // Restore broker PRTs from systemd FileDescriptorStore
+            if let Some(data) = prt_memfd::restore_prts(&mut systemd_fds) {
+                if let Err(e) = idprovider.import_broker_prts(&data).await {
+                    error!("Failed to import PRTs from FD store: {:?}", e);
+                } else {
+                    info!("Restored broker PRTs from FileDescriptorStore");
+                }
+            } else {
+                debug!("No broker PRTs in FileDescriptorStore (fresh boot or first start)");
+            }
+
             // Setup the tasks socket first.
             let (task_channel_tx, mut task_channel_rx) = channel(16);
             let task_channel_tx = Arc::new(task_channel_tx);
@@ -1187,17 +1372,38 @@ async fn main() -> ExitCode {
 
             let cachelayer = Arc::new(cl_inner);
 
-            // Setup the root-only socket. Take away all other access bits.
-            let before = unsafe { umask(0o0077) };
-            let task_listener = match UnixListener::bind(task_socket_path.clone()) {
-                Ok(l) => l,
-                Err(_e) => {
-                    error!("Failed to bind UNIX socket {}", task_socket_path);
+            // Setup the root-only task socket.
+            // Prefer a socket-activated fd from systemd; fall back to
+            // manual bind.
+            let task_listener = if let Some(fd) = systemd_fds.task_socket.take() {
+                // SAFETY: fd is valid and owned by this process, passed
+                // by systemd via socket activation.
+                let std_listener = unsafe {
+                    std::os::unix::net::UnixListener::from_raw_fd(fd)
+                };
+                if let Err(e) = std_listener.set_nonblocking(true) {
+                    error!("Failed to set task socket non-blocking: {}", e);
                     return ExitCode::FAILURE
                 }
+                match UnixListener::from_std(std_listener) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("Failed to convert task socket: {}", e);
+                        return ExitCode::FAILURE
+                    }
+                }
+            } else {
+                let before = unsafe { umask(0o0077) };
+                let listener = match UnixListener::bind(task_socket_path.clone()) {
+                    Ok(l) => l,
+                    Err(_e) => {
+                        error!("Failed to bind UNIX socket {}", task_socket_path);
+                        return ExitCode::FAILURE
+                    }
+                };
+                let _ = unsafe { umask(before) };
+                listener
             };
-            // Undo umask changes.
-            let _ = unsafe { umask(before) };
 
             // Pre-process /etc/passwd and /etc/group for nxset
             if process_etc_passwd_group(&cachelayer).await.is_err() {
@@ -1303,13 +1509,34 @@ async fn main() -> ExitCode {
                 info!("Stopped inotify watcher");
             });
 
-            // Spawn the himmelblau dbus broker
+            // Spawn the himmelblau dbus broker.
+            // Prefer a socket-activated fd from systemd; fall back to
+            // manual bind inside himmelblau_broker_serve_with_listener.
+            let broker_listener = if let Some(fd) = systemd_fds.broker_socket.take() {
+                let std_listener = unsafe {
+                    std::os::unix::net::UnixListener::from_raw_fd(fd)
+                };
+                if let Err(e) = std_listener.set_nonblocking(true) {
+                    error!("Failed to set broker socket non-blocking: {}", e);
+                    return ExitCode::FAILURE
+                }
+                match UnixListener::from_std(std_listener) {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        error!("Failed to convert broker socket: {}", e);
+                        return ExitCode::FAILURE
+                    }
+                }
+            } else {
+                None
+            };
             let dbus_cachelayer = cachelayer.clone();
             let e_broadcast_rx = broadcast_tx.subscribe();
-            let task_d = match himmelblau_broker_serve::<Broker>(
+            let task_d = match himmelblau_broker_serve_with_listener::<Broker>(
                 Broker { cachelayer: dbus_cachelayer },
-                &broker_socket_path,
-                e_broadcast_rx
+                if broker_listener.is_some() { None } else { Some(broker_socket_path.as_str()) },
+                e_broadcast_rx,
+                broker_listener,
             ).await {
                 Ok(task_d) => task_d,
                 Err(e) => {
@@ -1318,17 +1545,41 @@ async fn main() -> ExitCode {
                 },
             };
 
-            // Set the umask while we open the path for most clients.
-            let before = unsafe { umask(0) };
-            let listener = match UnixListener::bind(socket_path.clone()) {
-                Ok(l) => l,
-                Err(_e) => {
-                    error!("Failed to bind UNIX socket at {}", socket_path);
+            // Setup the main daemon socket.
+            // Prefer a socket-activated fd from systemd; fall back to
+            // manual bind.
+            let listener = if let Some(fd) = systemd_fds.main_socket.take() {
+                // SAFETY: fd is valid and owned by this process, passed
+                // by systemd via socket activation.
+                let std_listener = unsafe {
+                    std::os::unix::net::UnixListener::from_raw_fd(fd)
+                };
+                if let Err(e) = std_listener.set_nonblocking(true) {
+                    error!("Failed to set main socket non-blocking: {}", e);
                     return ExitCode::FAILURE
                 }
+                match UnixListener::from_std(std_listener) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("Failed to convert main socket: {}", e);
+                        return ExitCode::FAILURE
+                    }
+                }
+            } else {
+                let before = unsafe { umask(0) };
+                let listener = match UnixListener::bind(socket_path.clone()) {
+                    Ok(l) => l,
+                    Err(_e) => {
+                        error!("Failed to bind UNIX socket at {}", socket_path);
+                        return ExitCode::FAILURE
+                    }
+                };
+                let _ = unsafe { umask(before) };
+                listener
             };
-            // Undo umask changes.
-            let _ = unsafe { umask(before) };
+
+            // Keep a reference for PRT FD store persistence on service shutdown.
+            let shutdown_cachelayer = cachelayer.clone();
 
             let task_a = tokio::spawn(async move {
                 loop {
@@ -1346,7 +1597,7 @@ async fn main() -> ExitCode {
                                     tokio::spawn(async move {
                                         if let Err(e) = handle_client(socket, cachelayer_ref.clone(), &tc_tx, cfg_h).await
                                         {
-                                            error!("handle_client error occurred; error = {:?}", e);
+                                            debug!("handle_client disconnected; error = {:?}", e);
                                         }
                                     });
                                 }
@@ -1365,11 +1616,19 @@ async fn main() -> ExitCode {
 
             if systemd_booted {
                 if let Ok(monotonic_usec) = sd_notify::NotifyState::monotonic_usec_now() {
-                    let _ = sd_notify::notify(true, &[NotifyState::Ready, monotonic_usec]);
+                    let _ = sd_notify::notify(&[NotifyState::Ready, monotonic_usec]);
                 }
             }
 
-            drop(_enter);
+            // Ping the systemd watchdog at half the configured WatchdogSec interval.
+            let mut watchdog_interval = if systemd_booted {
+                std::env::var("WATCHDOG_USEC")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|usec| time::interval(Duration::from_micros(usec / 2)))
+            } else {
+                None
+            };
 
             loop {
                 tokio::select! {
@@ -1411,13 +1670,45 @@ async fn main() -> ExitCode {
                     } => {
                         // Ignore
                     }
+                    _ = async {
+                        match watchdog_interval.as_mut() {
+                            Some(interval) => interval.tick().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let _ = sd_notify::notify(&[NotifyState::Watchdog]);
+                    }
                 }
             }
 
             info!("Signal received, sending down signal to tasks");
+
+            // Persist broker PRTs to systemd FileDescriptorStore so they
+            // survive a daemon restart.  Always remove any previously stored
+            // FD first so stale credentials are never kept around.
+            if systemd_booted {
+                prt_memfd::remove_prts_from_fdstore();
+
+                match shutdown_cachelayer.export_broker_prts().await {
+                    Ok(data) if !data.is_empty() && data != b"{}".as_slice() => {
+                        if let Err(e) = prt_memfd::store_prts_to_fdstore(&data) {
+                            error!("Failed to store PRTs in FD store: {:?}", e);
+                        } else {
+                            info!("Saved broker PRTs to FileDescriptorStore");
+                        }
+                    }
+                    Ok(_) => {
+                        debug!("No broker PRTs to persist to FD store");
+                    }
+                    Err(e) => {
+                        error!("Failed to export PRTs: {:?}", e);
+                    }
+                }
+            }
+
             if systemd_booted {
                 if let Ok(monotonic_usec) = sd_notify::NotifyState::monotonic_usec_now() {
-                    let _ = sd_notify::notify(true, &[NotifyState::Stopping, monotonic_usec]);
+                    let _ = sd_notify::notify(&[NotifyState::Stopping, monotonic_usec]);
                 }
             }
 

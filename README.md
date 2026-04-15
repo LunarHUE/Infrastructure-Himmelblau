@@ -19,7 +19,9 @@ Intune MDM policies.
 
 ## Sponsorship
 
-[![SUSE](https://www.suse.com/siteassets/layout/suse-white-logo-green.svg)](https://www.suse.com)
+<a href="https://www.suse.com">
+  <img src="img/SUSE_founded_logo-green-stacked.png" alt="SUSE" width="220">
+</a>
 
 We gratefully acknowledge [SUSE](https://www.suse.com) as the primary sponsor of the Himmelblau project. Their support enables us to develop and maintain this open-source identity management solution.
 
@@ -41,6 +43,7 @@ These costs currently run about **$30–$50 per month**, and while we have a few
 Himmelblau is available for multiple Linux distributions, including openSUSE, SUSE Linux Enterprise (SLE), Fedora, Ubuntu, Debian, Red Hat Enterprise Linux (Rocky), and NixOS. Visit the [Himmelblau Downloads Page](https://himmelblau-idm.org/downloads.html) to fetch the appropriate packages for your distribution.
 
 ### openSUSE Tumbleweed
+
 For openSUSE Tumbleweed, refresh the repositories and install Himmelblau:
 
 ```shell
@@ -48,6 +51,7 @@ sudo zypper ref && sudo zypper in himmelblau nss-himmelblau pam-himmelblau himme
 ```
 
 ### openSUSE Leap and SUSE Linux Enterprise
+
 Add the appropriate repository for your version:
 
 ```shell
@@ -65,6 +69,7 @@ sudo zypper ref && sudo zypper in himmelblau nss-himmelblau pam-himmelblau himme
 ```
 
 ### Fedora and RHEL (including Rocky Linux)
+
 Download the RPMs from the [Downloads Page](https://himmelblau-idm.org/downloads.html) and install:
 
 ```shell
@@ -72,6 +77,7 @@ sudo dnf install ./himmelblau-<version>.rpm ./himmelblau-sshd-config-<version>.r
 ```
 
 ### Debian and Ubuntu
+
 Download the DEB packages and install:
 
 ```shell
@@ -80,11 +86,23 @@ sudo apt install ./himmelblau_<version>.deb ./himmelblau-sshd-config_<version>.d
 
 ### NixOS
 
-Himmelblau provides 2 packages and a module:
+Himmelblau provides multiple packages and a module:
 
-* `himmelblau.packages.<arch>.himmelblau`: The core authentication daemon intended for server deployments. (default package)
-* `himmelblau.packages.<arch>.himmelblau-desktop`: The daemon and GUI tools for 2FA signin within a (GTK) desktop environment.
-* `himmelblau.modules.himmelblau`: A NixOS Module that provides the most common options and service definitions.
+These are automatically installed if you use the module:
+
+- `himmelblau.packages.<arch>.daemon`: The core authentication daemon intended for server deployments.
+- `himmelblau.packages.<arch>.pam`: Required for the pam integration to work - your daemon is a bit useless without it.
+- `himmelblau.packages.<arch>.nss`: Required for the nss integration to work - your daemon is a bit useless without it.
+- `himmelblau.packages.<arch>.broker`: This one is a userspace daemon that responds to calls from the `sso` package.
+
+You may want to install this one extra if you use a browser other than firefox / chrome:
+
+- `himmelblau.packages.<arch>.sso`: Used to facilitate the communication to the broker
+
+These two are optional and need to be installed by you:
+
+- `himmelblau.packages.<arch>.aad-tool`: The cli to interact with your daemon - you probably want to install it.
+- `himmelblau.packages.<arch>.o365`: Installs `teams-for-linux` with shortcuts to the o365 suite
 
 #### Enabling the himmelblau cachix cache
 
@@ -96,17 +114,59 @@ $ nix profile install 'nixpkgs#cachix'
 $ cachix use himmelblau
 ```
 
-#### Classic Nixos configurations
+#### Nixos configurations with NPINS
+
+If you use a sources manager like `npins` (or `lon`) you can add the himmelblau by executing:
+`npins add github himmelblau-idm himmelblau -b main`
+
+```nix
+{
+  lib,
+  sources ? (import ./npins),
+  config,
+  ...
+}:
+let
+  himmelblau = import sources.himmelblau { inherit pkgs; };
+in {
+    imports = [ himmelblau.nixosModules.himmelblau ];
+
+    # To execute `aad-tool` you may want to add it to your system path
+    environment.systemPackages = [
+      himmelblau.packages.aad-tool
+      # himmelblau.packages.o365 # <-- if you want the o365 suite with `teams-for-linux`
+      # himmelblau.packages.sso # <-- if you use an other browser than firefox / chrome
+    ];
+
+    services.himmelblau.enable = true;
+    # Not required. But you most certainly want to set `domain` and `pam_allow_groups`
+    services.himmelblau.settings = {
+        domain = "my.domain.net";
+        pam_allow_groups = [ "ENTRA-GROUP-GUID-HERE" ];
+        local_groups = [ "wheel" "docker" ];
+    };
+}
+```
+
+#### Nixos configurations
 
 Classic NixOS configurations can use the `builtins.getFlake` function if they have enabled `flakes` compatability.
 
 ```nix
-{lib, ...}:
-let himmelblau = builtins.getFlake "github:himmelblau-idm/himmelblau/0.9.0";
+{lib, config, ...}:
+let himmelblau = builtins.getFlake "github:himmelblau-idm/himmelblau";
 in {
     imports = [ himmelblau.nixosModules.himmelblau ];
 
+    # To execute `aad-tool` you may want to add `himmelblau` to your system path
+    environment.systemPackages = [
+      himmelblau.packages.aad-tool
+      # himmelblau.packages.o365 # <-- if you want the o365 suite with `teams-for-linux`
+      # himmelblau.packages.sso # <-- if you use an other browser than firefox / chrome
+    ];
+
     services.himmelblau.enable = true;
+    # Not required. But you most certainly want to set `domain` and `pam_allow_groups`
     services.himmelblau.settings = {
         domain = "my.domain.net";
         pam_allow_groups = [ "ENTRA-GROUP-GUID-HERE" ];
@@ -117,20 +177,26 @@ in {
 
 #### Flake based configurations
 
-Flake based configurations add this repository to their inputs, enable the service, provide the minimal set of options.
+Flake based configurations add this repository to their inputs and enable the service.
 
 ```nix
 {
     inputs = {
-        nixpkgs.url = "github:nixos/nixpkgs/nixos-24.11";
+        nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
         himmelblau.url = "github:himmelblau-idm/himmelblau/main";
         himmelblau.inputs.nixpkgs.follows = "nixpkgs";
     };
     outputs = { self, nixpkgs, himmelblau }: {
-        nixosModules.azureEntraId = {
+        nixosModules.azureEntraId = { config, pkgs, lib, ... }: {
             imports = [ himmelblau.nixosModules.himmelblau ];
+            environment.systemPackages = [
+              himmelblau.packages."x86_64-linux".aad-tool
+              # himmelblau.packages."x86_64-linux".o365 # <-- if you want the o365 suite with `teams-for-linux`
+              # himmelblau.packages.sso # <-- if you use an other browser than firefox / chrome
+            ];
             services.himmelblau = {
                 enable = true;
+                # Not required. But you most certainly want to set `domain` and `pam_allow_groups`
                 settings = {
                     domain = "my.domain.net";
                     pam_allow_groups = [ "ENTRA-GROUP-GUID-HERE" ];
@@ -152,11 +218,16 @@ Flake based configurations add this repository to their inputs, enable the servi
 ## Demos
 
 ### Windows Hello on Linux via GDM
+
 [![Azure Entra ID Authentication for openSUSE: Windows Hello on Linux!](img/hello.png)](https://www.youtube.com/watch?v=rSeHxs0JX58 "Azure Entra ID Authentication for openSUSE: Windows Hello on Linux!")
 
 ### MFA Authentication over SSH
 
 [![Azure Entra ID MFA Authentication over SSH: Himmelblau](img/ssh.png)](https://www.youtube.com/watch?v=IAqC8FoYLGc "Azure Entra ID MFA Authentication over SSH: Himmelblau")
+
+## Device Authorization QR Behavior
+
+When a device authorization response includes `verification_uri_complete`, Himmelblau shows that complete URL in the QR code so users can scan and continue sign-in without typing the user code. If the complete URL is not provided, the QR code falls back to `verification_uri` and the user code prompt remains required.
 
 ---
 
@@ -190,9 +261,9 @@ Under the hood, `make install` uses your system package manager (`apt`, `dnf`/`y
 You can also target specific distros explicitly.
 Available targets (as of now):
 
-* **DEB:** `ubuntu22.04` `ubuntu24.04` `debian12` `debian13`
-* **RHEL family:** `rocky8` `rocky9` `rocky10` `fedora41` `fedora42` `fedora43` `rawhide`
-* **SUSE:** `sle15sp6` `sle15sp7` `sle16` `tumbleweed`
+- **DEB:** `ubuntu22.04` `ubuntu24.04` `debian12` `debian13`
+- **RHEL family:** `rocky8` `rocky9` `rocky10` `fedora41` `fedora42` `fedora43` `rawhide`
+- **SUSE:** `sle15sp6` `sle15sp7` `sle16` `tumbleweed`
 
 Examples:
 

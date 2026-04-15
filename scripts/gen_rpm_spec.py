@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from datetime import datetime
 import json
 import os
 import sys
@@ -261,7 +262,25 @@ def collect_zypper_deps(mod):
         for line in pkgs.split("\n"):
             pkg = line.strip().rstrip("\\").strip()
             if pkg:
-                final_pkgs.append(pkg)
+                # Some packages may be space-separated (e.g., "selinux-tools selinux-policy-devel")
+                for p in pkg.split():
+                    if p:
+                        final_pkgs.append(p)
+
+        # Apply SUSE-specific package name fixes
+        if cfg["family"] == "zypper":
+            fixed_pkgs = []
+            for p in final_pkgs:
+                # systemd should be systemd-mini for build requirements on SUSE
+                if p == "systemd":
+                    fixed_pkgs.append("systemd-mini")
+                # selinux-policy-targeted should be split into selinux-policy-devel and selinux-tools
+                elif p == "selinux-policy-targeted":
+                    fixed_pkgs.append("selinux-policy-devel")
+                    fixed_pkgs.append("selinux-tools")
+                else:
+                    fixed_pkgs.append(p)
+            final_pkgs = fixed_pkgs
 
         results[distname] = {
             "packages": final_pkgs,
@@ -297,6 +316,9 @@ def install_line(asset, dest_replace):
     for key, val in dest_replace.items():
         dest = dest.replace(key, val)
     mode = asset.get("mode", "755")
+    # Desktop files, icons, and other data files should not be executable
+    if src.endswith('.desktop') or src.endswith('.png') or src.endswith('.css'):
+        mode = "644"
     mode = '0'+mode if mode[0] != '0' else mode
     dest_dir, dest_name = os.path.split(dest)
     return f"install -m {mode} {src} %{{buildroot}}{dest}"
@@ -312,13 +334,24 @@ def file_line(asset, dest_replace):
     for key, val in dest_replace.items():
         dest = dest.replace(key, val)
     prefix = ""
-    if '/himmelblau.conf' in dest and "man/" not in dest and "doc/" not in dest and "ssh/" not in dest:
+    suffix = ""
+    # Only files in /etc should be marked as %config
+    # Check if dest is in /etc (via %{_sysconfdir} or literal etc/)
+    is_etc_file = dest.startswith("%{_sysconfdir}") or dest.startswith("etc/")
+    # Check if this is a man page or doc file - these should never be marked as config
+    is_manpage = "%{_mandir}" in dest or "/man/man" in dest
+    is_doc = "doc/" in dest
+    if is_etc_file and '/himmelblau.conf' in dest and not is_manpage and not is_doc and "ssh/" not in dest:
         prefix = "%config(noreplace) "
-    elif ('.conf' in dest or '.json' in dest) and "man/" not in dest and "doc/" not in dest:
+    elif is_etc_file and ('.conf' in dest or '.json' in dest) and not is_manpage and not is_doc:
         prefix = "%config "
-    return f"{prefix}{dest}"
+    # Man pages may be compressed, so use wildcard
+    if "%{_mandir}" in dest or "/man/man" in dest:
+        suffix = "*"
+    return f"{prefix}{dest}{suffix}"
 
 FILE_REPLACE = {
+        "usr/share/man": "%{_mandir}",  # Must come before usr/share
         "usr/lib/tmpfiles.d": "%{_tmpfilesdir}",
         "usr/lib64/security": "%{_pam_moduledir}",
         "etc/opt/chrome/native-messaging-hosts": "%{chrome_nm_dir}",
@@ -350,14 +383,30 @@ def generate_install_section(metadata):
     lines = []
 
     selinux = False
+    authselect = False
     for asset in assets:
         if 'selinux' in asset["source"] or 'selinux' in asset["dest"]:
             selinux = True
             continue
+        if 'authselect' in asset["source"] or 'authselect' in asset["dest"]:
+            authselect = True
+            continue
         lines.append(install_line(asset, FILE_REPLACE))
 
+    # authselect is not available on SUSE
+    if authselect:
+        lines.append("%if !0%{?suse_version}")
+        lines.append("install -D -d -m 0755 %{buildroot}/%{_datadir}/authselect/vendor/himmelblau/")
+        for asset in assets:
+            if 'authselect' in asset["source"] or 'authselect' in asset["dest"]:
+                lines.append(install_line(asset, FILE_REPLACE))
+        lines.append("%endif")
+
+    # SELinux is only available on newer SUSE versions
     if selinux:
         lines.append("%if 0%{?suse_version} > 1600 || 0%{?sle_version} >= 160000")
+        lines.append("install -D -d -m 0755 %{buildroot}/%{_selinux_pkgdir}/himmelblaud")
+        lines.append("install -D -d -m 0755 %{buildroot}/%{_selinux_docdir}")
         for asset in assets:
             if 'selinux' in asset["source"] or 'selinux' in asset["dest"]:
                 lines.append(install_line(asset, FILE_REPLACE))
@@ -390,9 +439,13 @@ def generate_files_section(metadata, name=None, dirs=[], extras=[]):
     lines.append("%%files%s" % (" -n %s" % name if name else ""))
 
     selinux = False
+    authselect = False
     for _dir in dirs:
         if 'selinux' in _dir:
             selinux = True
+            continue
+        if 'authselect' in _dir:
+            authselect = True
             continue
         lines.append(f"%dir {_dir}")
 
@@ -400,13 +453,31 @@ def generate_files_section(metadata, name=None, dirs=[], extras=[]):
         if 'selinux' in asset["source"] or 'selinux' in asset["dest"]:
             selinux = True
             continue
+        if 'authselect' in asset["source"] or 'authselect' in asset["dest"]:
+            authselect = True
+            continue
         lines.append(file_line(asset, FILE_REPLACE))
 
+    # authselect is not available on SUSE
+    if authselect:
+        lines.append("%if !0%{?suse_version}")
+        for _dir in dirs:
+            if 'authselect' in _dir:
+                lines.append(f"%dir {_dir}")
+        for asset in assets:
+            if 'authselect' in asset["source"] or 'authselect' in asset["dest"]:
+                lines.append(file_line(asset, FILE_REPLACE))
+        lines.append("%endif")
+
+    # SELinux is only available on newer SUSE versions
     if selinux:
         lines.append("%if 0%{?suse_version} > 1600 || 0%{?sle_version} >= 160000")
         for _dir in dirs:
             if 'selinux' in _dir:
                 lines.append(f"%dir {_dir}")
+        # Always add the SELinux package directories when selinux files are present
+        lines.append("%dir %{_selinux_pkgdir}")
+        lines.append("%dir %{_selinux_pkgdir}/himmelblaud")
         for asset in assets:
             if 'selinux' in asset["source"] or 'selinux' in asset["dest"]:
                 lines.append(file_line(asset, FILE_REPLACE))
@@ -501,10 +572,55 @@ def main() -> int:
         else:
             return line
 
+    # Wrap in non-SUSE conditional (for packages like authselect that don't exist on SUSE)
+    def non_suse_wrap(line):
+        return f"""\
+%if !0%{{?suse_version}}
+{line}
+%endif"""
+
+    # Generate BuildRequires lines with appropriate conditionals
+    def generate_build_requires(packages):
+        lines = []
+        selinux_pkgs = []
+        authselect_pkgs = []
+        normal_pkgs = []
+
+        for dep in packages:
+            dep = dep.strip()
+            if "authselect" in dep:
+                authselect_pkgs.append(dep)
+            elif "selinux" in dep:
+                selinux_pkgs.append(dep)
+            else:
+                normal_pkgs.append(dep)
+
+        # authselect packages (non-SUSE conditional)
+        if authselect_pkgs:
+            lines.append("%if !0%{?suse_version}")
+            for dep in authselect_pkgs:
+                lines.append(f"BuildRequires:  {dep}")
+            lines.append("%endif")
+
+        # Normal packages
+        for dep in normal_pkgs:
+            lines.append(f"BuildRequires:  {dep}")
+
+        # SELinux packages (SUSE-only conditional)
+        if selinux_pkgs:
+            lines.append("%if 0%{?suse_version} > 1600 || 0%{?sle_version} >= 160000")
+            for dep in selinux_pkgs:
+                lines.append(f"BuildRequires:  {dep}")
+            lines.append("%endif")
+
+        return "\n".join(lines)
+
     himmelblau_metadata = merge_metadata(["himmelblaud", "selinux"], metadata, root)
     nss_metadata = merge_metadata(["nss_himmelblau"], metadata, root)
     pam_metadata = merge_metadata(["pam_himmelblau"], metadata, root)
+    broker_metadata = merge_metadata(["broker"], metadata, root)
     sso_metadata = merge_metadata(["sso", "o365"], metadata, root)
+    sso_policies_metadata = merge_metadata(["sso-policies"], metadata, root)
     sshd_metadata = merge_metadata(["sshd-config"], metadata, root)
     qr_metadata = merge_metadata(["qr-greeter"], metadata, root)
     desc = """Himmelblau is an interoperability suite for Microsoft Azure Entra Id
@@ -515,7 +631,7 @@ Entra Id credentials."""
 #
 # spec file for package himmelblau
 #
-# Copyright (c) 2025 SUSE LLC and contributors
+# Copyright (c) {datetime.now().year} SUSE LLC and contributors
 #
 # All modifications and additions to the file contributed by third parties
 # remain the property of their copyright owners, unless otherwise agreed
@@ -559,7 +675,7 @@ BuildRequires:  cargo-packaging
 BuildRequires:  clang-devel
 BuildRequires:  patchelf
 BuildRequires:  systemd-rpm-macros
-{'\n'.join([sel_wrap('BuildRequires:  '+dep.strip()) for dep in deps[args.target]['packages']])}
+{generate_build_requires(deps[args.target]['packages'])}
 ExclusiveArch:  %{{rust_tier1_arches}}
 {dep_gen(himmelblau_metadata)}
 
@@ -570,6 +686,7 @@ ExclusiveArch:  %{{rust_tier1_arches}}
 Summary:        Azure Entra Id authentication PAM module
 Requires:       %{{name}} = %{{version}}
 {dep_gen(pam_metadata)}
+Suggests:       authselect
 
 %description -n pam-himmelblau
 {desc}
@@ -595,6 +712,16 @@ BuildArch:      noarch
 %description -n himmelblau-sshd-config
 {desc}
 
+%package -n himmelblau-broker
+Summary:        Azure Entra Id Browser broker service
+Requires:       %{{name}} = %{{version}}
+{dep_gen(broker_metadata)}
+
+%description -n himmelblau-broker
+Himmelblau Broker provides Azure Entra Id browser broker service functionality.
+It enables communication between the browser and the authentication backend,
+enabling single sign-on and other authentication features.
+
 %package -n himmelblau-sso
 Summary:        Azure Entra Id Browser SSO
 Requires:       %{{name}} = %{{version}}
@@ -606,9 +733,24 @@ Firefox, Chromium, Google Chrome, and Microsoft Edge (where installed),
 using native messaging and managed browser policies. It also provides
 web apps for common Office 365 applications (Teams, Outlook, etc).
 
+%package -n himmelblau-sso-policies
+Summary:        Browser policy files for Himmelblau SSO
+{dep_gen(sso_policies_metadata)}
+BuildArch:      noarch
+
+%description -n himmelblau-sso-policies
+Browser policy configuration files for Himmelblau SSO. This package
+installs policy files that automatically configure Chrome/Chromium and
+Firefox to install the required browser extension for SSO functionality.
+
+Install this package if you want automatic browser policy configuration.
+If you prefer to manage browser policies manually, you can skip this
+package and configure the extension installation yourself.
+
 %package -n himmelblau-qr-greeter
 Summary:        Azure Entra Id DAG URL QR code GNOME Shell extension
 {dep_gen(qr_metadata)}
+BuildArch:      noarch
 
 %description -n himmelblau-qr-greeter
 GNOME Shell extension that adds a QR code to authentication prompts
@@ -623,6 +765,9 @@ make rpm-servicefiles
 export HIMMELBLAU_ALLOW_MISSING_SELINUX=1
 %endif
 %{{cargo_build}} --workspace --exclude himmelblau-fuzz
+%if !0%{{?suse_version}}
+make authselect
+%endif
 
 %check
 %if !(0%{{?suse_version}} > 1600 || 0%{{?sle_version}} >= 160000)
@@ -633,13 +778,14 @@ export HIMMELBLAU_ALLOW_MISSING_SELINUX=1
 %install
 # NSS
 install -D -d -m 0755 %{{buildroot}}/%{{_libdir}}
+install -D -d -m 0755 %{{buildroot}}/%{{_tmpfilesdir}}
 strip --strip-unneeded target/release/libnss_himmelblau.so
 patchelf --set-soname libnss_himmelblau.so.2 target/release/libnss_himmelblau.so
 {generate_install_section(nss_metadata)}
 
 # PAM
 install -D -d -m 0755 %{{buildroot}}/%{{_pam_moduledir}}
-install -D -d -m 0755 %{{buildroot}}/%{{_datadir}}/authselect/vendor/himmelblau/
+install -D -d -m 0755 %{{buildroot}}/usr/lib/pam-config.d
 strip --strip-unneeded target/release/libpam_himmelblau.so
 {generate_install_section(pam_metadata)}
 
@@ -648,7 +794,6 @@ install -D -d -m 0755 %{{buildroot}}%{{_sbindir}}
 install -D -d -m 0755 %{{buildroot}}%{{_bindir}}
 install -D -d -m 0755 %{{buildroot}}%{{_unitdir}}
 install -D -d -m 0755 %{{buildroot}}/%{{_sysconfdir}}/himmelblau
-install -D -d -m 0755 %{{buildroot}}%{{_datarootdir}}/dbus-1/services
 install -D -d -m 0755 %{{buildroot}}%{{_sysconfdir}}/ssh/sshd_config.d
 install -D -d -m 0755 %{{buildroot}}%{{_sysconfdir}}/krb5.conf.d
 install -D -d -m 0755 %{{buildroot}}/%{{_unitdir}}/display-manager.service.d/
@@ -658,33 +803,44 @@ install -D -d -m 0755 %{{buildroot}}/%{{_tmpfilesdir}}/
 install -D -d -m 0755 %{{buildroot}}%{{_mandir}}/man1
 install -D -d -m 0755 %{{buildroot}}%{{_mandir}}/man5
 install -D -d -m 0755 %{{buildroot}}%{{_mandir}}/man8
+install -D -d -m 0755 %{{buildroot}}%{{_libexecdir}}
 strip --strip-unneeded target/release/himmelblaud
 strip --strip-unneeded target/release/himmelblaud_tasks
-strip --strip-unneeded target/release/broker
 strip --strip-unneeded target/release/aad-tool
 {generate_install_section(himmelblau_metadata)}
 pushd %{{buildroot}}%{{_sbindir}}
 ln -s himmelblaud rchimmelblaud
 ln -s himmelblaud_tasks rchimmelblaud_tasks
-ln -s broker rcbroker
 popd
 
 # SSHD Config
 install -D -d -m 0755 %{{buildroot}}%{{_sysconfdir}}/ssh/sshd_config.d
 {generate_install_section(sshd_metadata)}
 
+# Broker
+install -D -d -m 0755 %{{buildroot}}%{{_datarootdir}}/dbus-1/services
+strip --strip-unneeded target/release/broker
+{generate_install_section(broker_metadata)}
+pushd %{{buildroot}}%{{_sbindir}}
+ln -s broker rcbroker
+popd
+
 # Single Sign On
 strip --strip-unneeded target/release/linux-entra-sso
 install -D -d -m 0755 %{{buildroot}}%{{_libdir}}/mozilla/native-messaging-hosts
-install -D -d -m 0755 %{{buildroot}}%{{_sysconfdir}}/firefox/policies
 install -D -d -m 0755 %{{buildroot}}%{{chrome_nm_dir}}
 install -D -d -m 0755 %{{buildroot}}%{{chromium_nm_dir}}
 install -D -d -m 0755 %{{buildroot}}%{{chrome_ext_dir}}
-install -D -d -m 0755 %{{buildroot}}%{{chrome_policy_dir}}
-install -D -d -m 0755 %{{buildroot}}%{{chromium_policy_dir}}
 install -D -d -m 0755 %{{buildroot}}%{{_datadir}}/applications/
 %{{!?_iconsdir:%global _iconsdir %{{_datadir}}/icons}}
+install -D -d -m 0755 %{{buildroot}}%{{_iconsdir}}/hicolor/256x256/apps
 {generate_install_section(sso_metadata)}
+
+# SSO Policies
+install -D -d -m 0755 %{{buildroot}}%{{_sysconfdir}}/firefox/policies
+install -D -d -m 0555 %{{buildroot}}%{{chrome_policy_dir}}
+install -D -d -m 0555 %{{buildroot}}%{{chromium_policy_dir}}
+{generate_install_section(sso_policies_metadata)}
 
 # QR Greeter
 install -D -d -m 0755 %{{buildroot}}%{{_datarootdir}}/gnome-shell/extensions/qr-greeter@himmelblau-idm.org
@@ -700,16 +856,28 @@ install -D -d -m 0755 %{{buildroot}}%{{_datarootdir}}/gnome-shell/extensions/qr-
 
 {generate_script_sections(sso_metadata, name="himmelblau-sso")}
 
+{generate_script_sections(sso_policies_metadata, name="himmelblau-sso-policies")}
+
 {generate_script_sections(qr_metadata, name="himmelblau-qr-greeter")}
-{generate_files_section(himmelblau_metadata, name=None, dirs=["%{_sysconfdir}/himmelblau", "%{_localstatedir}/cache/himmelblau-policies", "%{_unitdir}/display-manager.service.d", "%{_docdir}/himmelblau-selinux", "%{_selinux_docdir}"])}
+
+{generate_files_section(himmelblau_metadata, name=None, dirs=["%{_sysconfdir}/himmelblau", "%{_localstatedir}/cache/himmelblau-policies", "%{_unitdir}/display-manager.service.d", "%{_datadir}/doc/himmelblau", "%{_docdir}/himmelblau-selinux", "%{_selinux_docdir}"], extras=["%{_sbindir}/rchimmelblaud", "%{_sbindir}/rchimmelblaud_tasks", "%ghost %dir /var/lib/private/himmelblaud"])}
 
 {generate_files_section(nss_metadata, name="libnss_himmelblau2", dirs=["%{_tmpfilesdir}"], extras=["%ghost %attr(0755,root,root) /var/cache/nss-himmelblau"])}
 
-{generate_files_section(pam_metadata, name="pam-himmelblau", dirs=["%{_datadir}/authselect", "%{_datadir}/authselect/vendor", "%{_datadir}/authselect/vendor/himmelblau"])}
+{generate_files_section(pam_metadata, name="pam-himmelblau", dirs=["/usr/lib/pam-config.d", "%{_datadir}/authselect", "%{_datadir}/authselect/vendor", "%{_datadir}/authselect/vendor/himmelblau"])}
 
 {generate_files_section(sshd_metadata, name="himmelblau-sshd-config", extras=["%if 0%{?sle_version} <= 150500\n%dir %{_sysconfdir}/ssh/sshd_config.d\n%endif"])}
 
-{generate_files_section(sso_metadata, name="himmelblau-sso", dirs=["%{_libdir}/mozilla", "%{_libdir}/mozilla/native-messaging-hosts", "%{_sysconfdir}/firefox", "%{_sysconfdir}/firefox/policies", "/etc/chromium", "/etc/chromium/native-messaging-hosts", "/etc/chromium/policies", "/etc/chromium/policies/managed", "/etc/opt/chrome", "/etc/opt/chrome/native-messaging-hosts", "/etc/opt/chrome/policies", "/etc/opt/chrome/policies/managed", "/usr/share/google-chrome", "%{chrome_nm_dir}", "%{chromium_nm_dir}", "%attr(0555,root,root) %{chrome_policy_dir}", "%attr(0555,root,root) %{chromium_policy_dir}", "%{chrome_ext_dir}", "%{_iconsdir}/hicolor", "%{_iconsdir}/hicolor/256x256", "%{_iconsdir}/hicolor/256x256/apps"])}""".rstrip() + "\n"
+{generate_files_section(broker_metadata, name="himmelblau-broker", extras=["%{_sbindir}/rcbroker"])}
+
+{generate_files_section(sso_metadata, name="himmelblau-sso", dirs=["%{_libdir}/mozilla", "%{_libdir}/mozilla/native-messaging-hosts", "/etc/chromium", "/etc/chromium/native-messaging-hosts", "/usr/share/google-chrome", "%{chrome_nm_dir}", "%{chromium_nm_dir}", "%{chrome_ext_dir}", "%{_iconsdir}/hicolor", "%{_iconsdir}/hicolor/256x256", "%{_iconsdir}/hicolor/256x256/apps"])}
+
+{generate_files_section(sso_policies_metadata, name="himmelblau-sso-policies", dirs=["/etc/firefox", "/etc/firefox/policies", "/etc/chromium/policies", "/etc/chromium/policies/managed", "/etc/opt/chrome", "/etc/opt/chrome/policies", "/etc/opt/chrome/policies/managed", "%attr(0555,root,root) %{chrome_policy_dir}", "%attr(0555,root,root) %{chromium_policy_dir}"])}
+
+{generate_files_section(qr_metadata, name="himmelblau-qr-greeter", dirs=["%{_datarootdir}/gnome-shell", "%{_datarootdir}/gnome-shell/extensions", "%{_datarootdir}/gnome-shell/extensions/qr-greeter@himmelblau-idm.org"])}
+
+%changelog
+""".rstrip() + "\n"
     if args.output:
         with open(args.output, 'w') as w:
             w.write(spec_contents)
