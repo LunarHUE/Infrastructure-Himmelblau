@@ -28,10 +28,18 @@ use serde_json::json;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use url::Url;
 
 #[derive(Serialize, Deserialize, Debug)]
 struct AccountReq {
     username: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct PopParamsReq {
+    #[serde(rename = "authenticationScheme")]
+    authentication_scheme: Option<String>,
+    kid: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -40,6 +48,10 @@ struct AuthParametersReq {
     requested_scopes: Vec<String>,
     #[serde(rename = "clientId")]
     client_id: Option<String>,
+    #[serde(rename = "redirectUri")]
+    redirect_uri: Option<String>,
+    #[serde(rename = "popParams")]
+    pop_params: Option<PopParamsReq>,
     account: Option<AccountReq>,
 }
 
@@ -53,6 +65,37 @@ struct TokenReq {
 #[derive(Serialize, Deserialize, Debug)]
 struct SsoCookieReq {
     account: AccountReq,
+    #[serde(rename = "ssoUrl")]
+    sso_url: Option<String>,
+}
+
+/// Extract the `sso_nonce` query parameter from an SSO URL, if present.
+/// Returns `None` when the parameter is missing or empty/whitespace-only.
+fn extract_sso_nonce(sso_url: Option<&str>) -> Option<String> {
+    let url_str = sso_url?;
+    let url = Url::parse(url_str).ok()?;
+    url.query_pairs()
+        .find(|(k, _)| k == "sso_nonce")
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// Build a `req_cnf` value from the broker request's `popParams`.
+/// When `popParams.authenticationScheme` is `"Pop"` and `kid` is set
+/// (e.g. for RDS AAD / Cloud PC), we produce
+/// `base64url({"kid":"<kid>"})` which Entra expects as the `req_cnf`
+/// query / body parameter. Requests without the PoP scheme or without
+/// a kid are treated as bearer token requests (returns None).
+fn build_req_cnf(pop_params: &Option<PopParamsReq>) -> Option<String> {
+    let pp = pop_params.as_ref()?;
+    if !pp.authentication_scheme.as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("pop"))
+    {
+        return None;
+    }
+    let kid = pp.kid.as_deref().map(str::trim).filter(|k| !k.is_empty())?;
+    let json = serde_json::json!({"kid": kid}).to_string();
+    Some(URL_SAFE_NO_PAD.encode(json.as_bytes()))
 }
 
 #[derive(Clone)]
@@ -97,12 +140,32 @@ impl HimmelblauBroker for Broker {
         if account.username.to_lowercase() != user.spn.to_lowercase() {
             return Err("Invalid request for user!".into());
         }
+        // Normalize and validate the redirect URI: treat empty/whitespace as
+        // None, and reject values that are not valid URIs or that contain fragments.
+        let redirect_uri = match request.auth_parameters.redirect_uri {
+            Some(ref uri) => {
+                let trimmed = uri.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    let parsed = Url::parse(trimmed).map_err(|_| "Invalid redirectUri")?;
+                    if parsed.fragment().is_some() {
+                        return Err("Invalid redirectUri: fragment not allowed".into());
+                    }
+                    Some(trimmed.to_string())
+                }
+            }
+            None => None,
+        };
+        let req_cnf = build_req_cnf(&request.auth_parameters.pop_params);
         let token = self
             .cachelayer
             .get_user_accesstoken(
                 Id::Name(user.spn.clone()),
                 request.auth_parameters.requested_scopes,
                 request.auth_parameters.client_id,
+                redirect_uri,
+                req_cnf,
             )
             .await
             .ok_or("Failed to authenticate user")?;
@@ -147,6 +210,7 @@ impl HimmelblauBroker for Broker {
                     "homeAccountId": format!("{}.{}", user.uuid.to_string(), user.tenant_id.map(|uuid| uuid.to_string()).unwrap_or("".to_string())),
                     "localAccountId": user.uuid.to_string(),
                     "name": user.displayname,
+                    "passwordExpiry": 0,
                     "realm": user.tenant_id.map(|uuid| uuid.to_string()).unwrap_or("".to_string()),
                     "username": user.spn
                 }
@@ -184,9 +248,18 @@ impl HimmelblauBroker for Broker {
         if request.account.username.to_lowercase() != user.spn.to_lowercase() {
             return Err("Invalid request for user!".into());
         }
+        // Extract sso_nonce from the ssoUrl query parameter if present.
+        // When no sso_nonce is provided (proactive SSO flow, e.g. the linux-entra-sso
+        // extension setting a static header), the cookie will be generated
+        // with an iat claim instead of a server nonce, giving it a longer
+        // validity window.
+        let sso_nonce = extract_sso_nonce(request.sso_url.as_deref());
         let prt = self
             .cachelayer
-            .get_user_prt_cookie(Id::Name(user.spn.clone()))
+            .get_user_prt_cookie(
+                Id::Name(user.spn.clone()),
+                sso_nonce.as_deref(),
+            )
             .await
             .ok_or("Failed to fetch prt sso cookie")?;
         let res = json!({

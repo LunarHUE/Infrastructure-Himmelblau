@@ -22,8 +22,8 @@
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{symlink, DirBuilderExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::unix::fs::{symlink, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str;
 use std::time::Duration;
@@ -34,17 +34,17 @@ use futures::{SinkExt, StreamExt};
 use himmelblau::graph::Graph;
 use himmelblau_policies::policies::apply_intune_policy;
 use himmelblau_unix_common::config::{split_username, HimmelblauConfig};
-use himmelblau_unix_common::constants::{DEFAULT_CCACHE_DIR, DEFAULT_CONFIG_PATH};
+use himmelblau_unix_common::constants::{DEFAULT_CONFIG_PATH, DEFAULT_KERBEROS_CONF_DIR};
 use himmelblau_unix_common::unix_proto::{HomeDirectoryInfo, TaskRequest, TaskResponse};
 use kanidm_utils_users::{get_effective_gid, get_effective_uid};
+use libc::uid_t;
 use libc::{lchown, umask};
-use libc::{mode_t, uid_t};
+use libkrimes::proto::KerberosCredentials;
 use sd_notify::NotifyState;
 use sketching::tracing_forest::traits::*;
 use sketching::tracing_forest::util::*;
 use sketching::tracing_forest::{self};
 use std::fs::OpenOptions;
-use std::fs::{DirBuilder, File};
 use std::io::Write;
 use std::process::Command;
 use tokio::net::UnixStream;
@@ -264,7 +264,33 @@ fn add_user_to_group(account_id: &str, local_group: &str) {
     }
 }
 
+fn user_in_group(account_id: &str, local_group: &str) -> bool {
+    let output = Command::new("getent")
+        .arg("group")
+        .arg(local_group)
+        .output();
+
+    if let Ok(out) = output {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if let Some(users) = stdout.split(':').nth(3) {
+                return users.split(',').any(|u| u == account_id);
+            }
+        }
+    }
+    false
+}
+
 fn remove_user_from_group(account_id: &str, local_group: &str) {
+    if !user_in_group(account_id, local_group) {
+        trace!(
+            "User {} is not a member of {}, nothing to remove",
+            account_id,
+            local_group
+        );
+        return;
+    }
+
     match Command::new("gpasswd")
         .arg("-d")
         .arg(account_id)
@@ -319,51 +345,174 @@ fn execute_user_script(account_id: &str, script: &str, access_token: &str) -> i3
     }
 }
 
-fn write_bytes_to_file(bytes: &[u8], filename: &Path, uid: uid_t, gid: uid_t, mode: mode_t) -> i32 {
+/// Check if a user already has an entry in the given subid file
+fn user_has_subid_entry(username: &str, subid_file: &Path) -> bool {
+    if let Ok(contents) = fs::read_to_string(subid_file) {
+        let prefix = format!("{}:", username);
+        contents.lines().any(|line| line.starts_with(&prefix))
+    } else {
+        false
+    }
+}
+
+/// Add a subordinate ID entry to /etc/subuid or /etc/subgid
+/// Format: username:start:count
+fn add_subid_entry(
+    username: &str,
+    start: u32,
+    count: u32,
+    subid_file: &Path,
+) -> Result<(), String> {
+    // Check if user already has an entry
+    if user_has_subid_entry(username, subid_file) {
+        debug!(
+            "User {} already has an entry in {}, skipping",
+            username,
+            subid_file.display()
+        );
+        return Ok(());
+    }
+
+    // Append the new entry
+    let entry = format!("{}:{}:{}\n", username, start, count);
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(subid_file)
+        .map_err(|e| format!("Failed to open {}: {:?}", subid_file.display(), e))?;
+
+    file.write_all(entry.as_bytes())
+        .map_err(|e| format!("Failed to write to {}: {:?}", subid_file.display(), e))?;
+
+    info!(
+        "Added subordinate ID entry for {} in {}: start={}, count={}",
+        username,
+        subid_file.display(),
+        start,
+        count
+    );
+
+    Ok(())
+}
+
+/// Set up subordinate UID/GID mappings for a user
+fn setup_subordinate_ids(username: &str, start: u32, count: u32) -> Result<(), String> {
+    let subuid_path = Path::new("/etc/subuid");
+    let subgid_path = Path::new("/etc/subgid");
+
+    // Add entry to /etc/subuid
+    add_subid_entry(username, start, count, subuid_path)?;
+
+    // Add entry to /etc/subgid (same range)
+    add_subid_entry(username, start, count, subgid_path)?;
+
+    Ok(())
+}
+
+fn store_tgt(tgt: &KerberosCredentials, uid: uid_t, gid: uid_t) -> Result<(), String> {
+    // Usually default_ccache_name in /etc/krb5.conf contains a %{uid} substitution,
+    // which will be '0' (root) for the tasks daemon because it runs as root. Force
+    // the ccache name.
+    // TODO: Add a new himmelblau.conf option to define the ccache name
+    let ccname = Some(format!("KEYRING:persistent:{}", uid));
+
+    debug!(?ccname, "Storing kerberos ticket in credential cache");
+
+    let guard = uzers::switch::switch_user_group(uid, gid)
+        .map_err(|e| format!("Failed to switch user/group: {}", e))?;
+
+    let mut ccache = match libkrimes::ccache::resolve(ccname.as_deref()) {
+        Ok(ccache) => ccache,
+        Err(e) => {
+            drop(guard);
+            let msg = format!("Failed to resolve credential cache {:?}: {:?}", ccname, e);
+            return Err(msg);
+        }
+    };
+
+    match ccache.init(tgt.name(), None) {
+        Ok(_) => (),
+        Err(e) => {
+            drop(guard);
+            let msg = format!("Failed to init credential cache {:?}: {:?}", ccname, e);
+            return Err(msg);
+        }
+    }
+
+    match ccache.store(tgt) {
+        Ok(_) => (),
+        Err(e) => {
+            drop(guard);
+            let msg = format!("Failed to store TGT in credential cache: {:?}", e);
+            return Err(msg);
+        }
+    }
+
+    drop(guard);
+
+    Ok(())
+}
+
+fn write_kerberos_config_snippet(
+    top_level_names: Option<String>,
+    tenant_id: &str,
+) -> Result<(), String> {
+    if tenant_id.is_empty() {
+        return Err("Failed to write Kerberos config snippet, empty tenant_id".to_string());
+    }
+
+    // The tenant_id will be used in a file path. Validate it is really an UUID.
+    uuid::Uuid::try_parse(tenant_id).map_err(|x| format!("Failed to validate tenant ID: {x}"))?;
+
+    let krb_conf_dir = PathBuf::from(DEFAULT_KERBEROS_CONF_DIR);
+
+    trace!(?krb_conf_dir, "Check kerberos config dir exists");
+    match std::fs::exists(&krb_conf_dir) {
+        Ok(true) => match &krb_conf_dir.is_dir() {
+            false => Err(format!("Path {krb_conf_dir:?} is not a directory")),
+            true => Ok(()),
+        },
+        Ok(false) => Err(format!("Path {krb_conf_dir:?} does not exist")),
+        Err(e) => Err(format!("Failed to check if {krb_conf_dir:?} exists: {e}")),
+    }?;
+
+    let krb_snippet = krb_conf_dir.join(format!("himmelblau_{tenant_id}.conf"));
     let mut file = match OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
-        .mode(mode)
-        .open(filename)
+        .mode(0o644)
+        .open(&krb_snippet)
     {
         Ok(file) => file,
-        Err(_) => return 1,
+        Err(e) => return Err(format!("Failed to open {krb_snippet:?}: {e}")),
     };
 
-    if chown(filename, uid, gid).is_err() {
-        return 3;
-    }
+    let libdefs = "[libdefaults]\n\tdns_canonicalize_hostname = false\n";
+    file.write_all(libdefs.as_bytes())
+        .map_err(|e| format!("Failed to write to {krb_snippet:?}: {e}"))?;
 
-    if file.write_all(bytes).is_err() {
-        return 2;
-    }
+    let realms = format!(
+        "[realms]\n\tKERBEROS.MICROSOFTONLINE.COM = {{\n\t\tkdc = https://login.microsoftonline.com/{tenant_id}/kerberos\n\t}}\n"
+    );
+    file.write_all(realms.as_bytes())
+        .map_err(|e| format!("Failed to write to {krb_snippet:?}: {e}"))?;
 
-    0
-}
+    let domain_realms: Vec<String> = match top_level_names {
+        Some(s) => s
+            .split(",")
+            .map(|e| e.trim())
+            .filter(|e| !e.contains(":"))
+            .map(|x| format!("\t{x} = KERBEROS.MICROSOFTONLINE.COM"))
+            .collect(),
+        None => vec![],
+    };
+    let domain_realms = format!("[domain_realm]\n{}\n", domain_realms.join("\n"));
+    file.write_all(domain_realms.as_bytes())
+        .map_err(|e| format!("Failed to write to {krb_snippet:?}: {e}"))?;
 
-fn create_ccache_dir(ccache_dir: &Path, uid: uid_t, gid: uid_t) -> io::Result<()> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(ccache_dir)
-        .map_err(|e| {
-            error!(
-                "Failed to create the krb5 ccache directory '{}': {:?}",
-                ccache_dir.display(),
-                e
-            );
-            e
-        })?;
-
-    std::os::unix::fs::chown(ccache_dir, Some(uid), Some(gid)).map_err(|e| {
-        error!(
-            "Failed to set the krb5 ccache directory '{}' owner and group: {:?}",
-            ccache_dir.display(),
-            e
-        );
-        e
-    })
+    Ok(())
 }
 
 async fn handle_tasks(stream: UnixStream, cfg: &HimmelblauConfig) {
@@ -375,7 +524,7 @@ async fn handle_tasks(stream: UnixStream, cfg: &HimmelblauConfig) {
         let _ = span.enter();
         match next_req {
             Some(Ok(TaskRequest::HomeDirectory(info))) => {
-                debug!("Received task -> HomeDirectory({:?})", info);
+                debug!("Received task -> HomeDirectory(...)");
                 let domain = split_username(&info.name).map(|(_, domain)| domain);
 
                 let resp = match create_home_directory(
@@ -434,47 +583,43 @@ async fn handle_tasks(stream: UnixStream, cfg: &HimmelblauConfig) {
                     return;
                 }
             }
-            Some(Ok(TaskRequest::KerberosCCache(uid, gid, cloud_ccache, ad_ccache))) => {
-                debug!("Received task -> KerberosCCache({}, ...)", uid);
-                let ccache_dir_str = format!("{}{}", DEFAULT_CCACHE_DIR, uid);
-                let ccache_dir = Path::new(&ccache_dir_str);
+            Some(Ok(TaskRequest::KerberosConfig(top_level_names, tenant_id))) => {
+                debug!("Received task -> KerberosConfig(...)");
 
-                let response = match create_ccache_dir(ccache_dir, uid, gid) {
-                    Ok(()) => {
-                        let primary_name = ccache_dir.join("primary");
-                        write_bytes_to_file(b"tkt\n", &primary_name, uid, gid, 0o600);
-
-                        let cloud_ret = if !cloud_ccache.is_empty() {
-                            // The cloud_tkt is the primary only if the on-prem isn't
-                            // present.
-                            let name = if !ad_ccache.is_empty() {
-                                "cloud_tkt"
-                            } else {
-                                "tkt"
-                            };
-                            let cloud_ccache_name = ccache_dir.join(name);
-                            write_bytes_to_file(&cloud_ccache, &cloud_ccache_name, uid, gid, 0o600)
-                                * 10
-                        } else {
-                            0
-                        };
-
-                        let ad_ret = if !ad_ccache.is_empty() {
-                            // If the on-prem ad_tkt exists, it overrides the primary
-                            let name = "tkt";
-                            let ad_ccache_name = ccache_dir.join(name);
-                            write_bytes_to_file(&ad_ccache, &ad_ccache_name, uid, gid, 0o600) * 100
-                        } else {
-                            0
-                        };
-                        TaskResponse::Success(cloud_ret + ad_ret)
-                    }
-                    Err(_) => TaskResponse::Error(
-                        "Failed to create credential cache directory".to_string(),
+                let response = match tenant_id {
+                    Some(t) => match write_kerberos_config_snippet(top_level_names, &t) {
+                        Ok(_) => TaskResponse::Success(0),
+                        Err(msg) => TaskResponse::Error(msg),
+                    },
+                    None => TaskResponse::Error(
+                        "Failed to write Kerberos config snippet, no tenant_id".to_string(),
                     ),
                 };
 
-                // Indicate the status response
+                if let Err(e) = reqs.send(response).await {
+                    error!("Error -> {:?}", e);
+                    return;
+                }
+            }
+            Some(Ok(TaskRequest::KerberosTGTs(uid, gid, tgt_cloud, tgt_ad))) => {
+                debug!("Received task -> KerberosTGTs({}, {}, ...)", uid, gid);
+
+                let cloud_ret = if let Some(tgt_cloud) = tgt_cloud {
+                    store_tgt(tgt_cloud.as_ref(), uid, gid)
+                } else {
+                    Ok(())
+                };
+
+                let ad_ret = if let Some(tgt_ad) = tgt_ad {
+                    store_tgt(tgt_ad.as_ref(), uid, gid)
+                } else {
+                    Ok(())
+                };
+
+                let response = match cloud_ret.and(ad_ret) {
+                    Ok(_) => TaskResponse::Success(0),
+                    Err(msg) => TaskResponse::Error(msg),
+                };
                 if let Err(e) = reqs.send(response).await {
                     error!("Error -> {:?}", e);
                     return;
@@ -483,16 +628,35 @@ async fn handle_tasks(stream: UnixStream, cfg: &HimmelblauConfig) {
             Some(Ok(TaskRequest::LoadProfilePhoto(mut account_id, access_token))) => {
                 debug!("Received task -> LoadProfilePhoto(...)");
                 let icons_dir = "/var/lib/AccountsService/icons/";
+                let users_dir = "/var/lib/AccountsService/users/";
                 if !Path::new(icons_dir).exists() {
                     info!("Profile photo directory '{}' doesn't exist.", icons_dir);
                 } else {
                     let upn = account_id.clone();
                     let domain = split_username(&upn).map(|(_, domain)| domain);
                     account_id = cfg.map_upn_to_name(&account_id);
+
+                    // Validate account_id to prevent path traversal and
+                    // cross-user aliasing. Reject rather than strip to avoid
+                    // collisions (e.g. "a/lice" and "alice" mapping to the same file).
+                    if account_id.is_empty()
+                        || !account_id.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '@' | '.' | '_' | '-')
+                        })
+                    {
+                        error!(
+                            "Invalid account_id for profile photo - disallowed characters, rejecting"
+                        );
                     // Set the profile picture
-                    if let Some(domain) = domain {
-                        let filename = format!("/var/lib/AccountsService/icons/{}", account_id);
-                        match File::create(&filename) {
+                    } else if let Some(domain) = domain {
+                        let filename = format!("{}{}", icons_dir, account_id);
+                        match OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .custom_flags(libc::O_NOFOLLOW)
+                            .open(&filename)
+                        {
                             Ok(file) => {
                                 let authority_host = cfg.get_authority_host(domain);
                                 let tenant_id = cfg.get_tenant_id(domain);
@@ -517,8 +681,14 @@ async fn handle_tasks(stream: UnixStream, cfg: &HimmelblauConfig) {
                                 error!("Failed creating file for user profile photo: {:?}", e)
                             }
                         }
-                        let user_file = format!("/var/lib/AccountsService/users/{}", account_id);
-                        match File::create(&user_file) {
+                        let user_file = format!("{}{}", users_dir, account_id);
+                        match OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .custom_flags(libc::O_NOFOLLOW)
+                            .open(&user_file)
+                        {
                             Ok(mut file) => {
                                 let contents =
                                     format!("[User]\nIcon={}\nSystemAccount=false\n", filename);
@@ -598,12 +768,31 @@ async fn handle_tasks(stream: UnixStream, cfg: &HimmelblauConfig) {
                     return;
                 }
             }
+            Some(Ok(TaskRequest::SubordinateIds(username, start, count))) => {
+                debug!(
+                    "Received task -> SubordinateIds({}, {}, {})",
+                    username, start, count
+                );
+
+                let resp = match setup_subordinate_ids(&username, start, count) {
+                    Ok(()) => TaskResponse::Success(0),
+                    Err(msg) => {
+                        error!("Failed to setup subordinate IDs for {}: {}", username, msg);
+                        TaskResponse::Error(msg)
+                    }
+                };
+
+                if let Err(e) = reqs.send(resp).await {
+                    error!("Error -> {:?}", e);
+                    return;
+                }
+            }
             Some(Err(e)) => {
                 error!("Error -> {:?}", e);
                 return;
             }
-            _ => {
-                error!("Error -> Unexpected response");
+            None => {
+                debug!("Task connection closed");
                 return;
             }
         }
@@ -708,9 +897,19 @@ async fn main() -> ExitCode {
 
             if systemd_booted {
                 if let Ok(monotonic_usec) = sd_notify::NotifyState::monotonic_usec_now() {
-                    let _ = sd_notify::notify(true, &[NotifyState::Ready, monotonic_usec]);
+                    let _ = sd_notify::notify(&[NotifyState::Ready, monotonic_usec]);
                 }
             }
+
+            // Ping the systemd watchdog at half the configured WatchdogSec interval.
+            let mut watchdog_interval = if systemd_booted {
+                std::env::var("WATCHDOG_USEC")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|usec| time::interval(Duration::from_micros(usec / 2)))
+            } else {
+                None
+            };
 
             loop {
                 tokio::select! {
@@ -753,13 +952,21 @@ async fn main() -> ExitCode {
                     } => {
                         // Ignore
                     }
+                    _ = async {
+                        match watchdog_interval.as_mut() {
+                            Some(interval) => interval.tick().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let _ = sd_notify::notify(&[NotifyState::Watchdog]);
+                    }
                 }
             }
 
             info!("Signal received, shutting down");
             if systemd_booted {
                 if let Ok(monotonic_usec) = sd_notify::NotifyState::monotonic_usec_now() {
-                    let _ = sd_notify::notify(true, &[NotifyState::Stopping, monotonic_usec]);
+                    let _ = sd_notify::notify(&[NotifyState::Stopping, monotonic_usec]);
                 }
             }
 

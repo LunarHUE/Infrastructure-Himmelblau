@@ -1,28 +1,69 @@
-SHELL := /bin/bash
+SHELL := /usr/bin/env bash
 
 all: .packaging dockerfiles ## Auto-detect host distro and build packages just for this host
 	@set -euo pipefail; \
 	. /etc/os-release; \
-	ID="$${ID}"; VER="$${VERSION_ID}"; LIKE="$${ID_LIKE:-}"; \
+	ID="$$ID"; VER="$$VERSION_ID"; LIKE="$${ID_LIKE:-}"; \
 	TARGET=""; \
 	echo "Detecting host distro: ID=$$ID VERSION_ID=$$VER ID_LIKE=$$LIKE"; \
+	\
 	case "$$ID" in \
-	  ubuntu)         case "$$VER" in 22.04*) TARGET="ubuntu22.04" ;; 24.04*) TARGET="ubuntu24.04" ;; esac ;; \
-	  linuxmint)      case "$$VER" in 21.*)   TARGET="ubuntu22.04" ;; 22*|23*) TARGET="ubuntu24.04" ;; esac ;; \
-	  debian)         case "$$VER" in 12*|12.*) TARGET="debian12" ;; 13*|13.*) TARGET="debian13" ;; esac ;; \
+	  ubuntu) \
+	    case "$$VER" in \
+	      22.04*) TARGET="ubuntu22.04" ;; \
+	      24.04*) TARGET="ubuntu24.04" ;; \
+	      25.10*) TARGET="ubuntu25.10" ;; \
+	      26.04*) TARGET="ubuntu26.04" ;; \
+	    esac ;; \
+	  linuxmint) \
+	    case "$$VER" in \
+	      21.*) TARGET="ubuntu22.04" ;; \
+	      22*|23*) TARGET="ubuntu24.04" ;; \
+	    esac ;; \
+	  debian) \
+	    case "$$VER" in \
+	      12*|12.*) TARGET="debian12" ;; \
+	      13*|13.*) TARGET="debian13" ;; \
+	    esac ;; \
 	  rocky|almalinux|rhel|ol|oraclelinux|centos|centos_stream|centos-stream) \
-		major=$$(echo "$$VER" | awk -F. '{print $$1}'); \
-		case "$$major" in 8) TARGET="rocky8" ;; 9) TARGET="rocky9" ;; 10) TARGET="rocky10" ;; esac ;; \
-	  fedora)         case "$$VER" in 42*) TARGET="fedora42" ;; 43*) TARGET="fedora43" ;; *) TARGET="rawhide" ;; esac ;; \
+	    major=$$(echo "$$VER" | awk -F. '{print $$1}'); \
+	    case "$$major" in \
+	      8) TARGET="rocky8" ;; \
+	      9) TARGET="rocky9" ;; \
+	      10) TARGET="rocky10" ;; \
+	    esac ;; \
+	  fedora) \
+	    case "$$VER" in \
+	      42*) TARGET="fedora42" ;; \
+	      43*) TARGET="fedora43" ;; \
+	      *) TARGET="rawhide" ;; \
+	    esac ;; \
 	  sles|sled|sle_micro|suse|suse-linux-enterprise) \
-		case "$$VER" in 15.6*|15-SP6*) TARGET="sle15sp6" ;; 15.7*|15-SP7*) TARGET="sle15sp7" ;; 16*|16.*) TARGET="sle16" ;; esac ;; \
-	  opensuse-leap)  case "$$VER" in 15.6*) TARGET="sle15sp6" ;; 15.7*) TARGET="sle15sp7" ;; esac ;; \
+	    case "$$VER" in \
+	      15.6*|15-SP6*) TARGET="sle15sp6" ;; \
+	      15.7*|15-SP7*) TARGET="sle15sp7" ;; \
+	      16*|16.*) TARGET="sle16" ;; \
+	    esac ;; \
+	  opensuse-leap) \
+	    case "$$VER" in \
+	      15.6*) TARGET="sle15sp6" ;; \
+	      15.7*) TARGET="sle15sp7" ;; \
+	    esac ;; \
 	  opensuse-tumbleweed) TARGET="tumbleweed" ;; \
+	  gentoo)         TARGET="gentoo" ;; \
+	  amzn)          case "$$VER" in 2023) TARGET="amzn2023" ;; esac ;; \
 	esac; \
-	if [ -z "$$TARGET" ]; then echo "Error: unsupported or unmapped distro: $$ID $$VER"; exit 2; fi; \
-	all_targets="$(ALL_PACKAGE_TARGETS)"; \
-	case " $${all_targets} " in *" $$TARGET "*) ;; \
-	  *) echo "Error: no packaging rule for '$$TARGET' (supported: $${all_targets})"; exit 3 ;; esac; \
+	\
+	if [ -z "$$TARGET" ]; then \
+	  echo "Error: unsupported or unmapped distro: $$ID $$VER"; \
+	  exit 2; \
+	fi; \
+	\
+	case " $(ALL_PACKAGE_TARGETS) " in \
+	  *" $$TARGET "*) ;; \
+	  *) echo "Error: no packaging rule for '$$TARGET' (supported: $(ALL_PACKAGE_TARGETS))"; exit 3 ;; \
+	esac; \
+	\
 	echo "Building packages for target '$$TARGET'…"; \
 	$(MAKE) $$TARGET; \
 	echo "Packages written to ./packaging/"
@@ -35,8 +76,18 @@ test: dockerfiles ## Run cargo tests in a container
 		-v $(CURDIR)/target/test:/himmelblau/target \
                 himmelblau-test-build
 
+test-selinux: ## Test the SELinux policy to ensure it builds
+	./scripts/test_selinux_policy.py --fix -v --distros rocky8,rocky9,rocky10,fedora42,fedora43,tumbleweed,sle16
+
 clean: ## Remove cargo build artifacts
 	cargo clean
+
+setup-hooks: ## Configure git to use project hooks (SELinux, docs-xml, Cargo.nix regen)
+	git config core.hooksPath .githooks
+	@echo "Git hooks configured. Pre-commit hook will:"
+	@echo "  - Run 'make test-selinux' when SELinux policy files are changed"
+	@echo "  - Auto-regenerate NixOS options/man page when XML definitions change"
+	@echo "  - Run 'nix run nixpkgs#crate2nix -- generate' when Cargo.lock changes"
 
 PLATFORM := $(shell grep '^ID=' /etc/os-release | awk -F= '{ print $$2 }' | tr -d '"')
 
@@ -66,10 +117,17 @@ nix: .packaging ## Build Nix packages into ./packaging/
 		$(NIX) --extra-experimental-features 'nix-command flakes' build ".#$$v" --out-link ./packaging/nix-$$v-result; \
 	done
 
-DEB_TARGETS := ubuntu22.04 ubuntu24.04 debian12 debian13
-RPM_TARGETS := rocky8 rocky9 rocky10 tumbleweed rawhide fedora42 fedora43
+DEB_TARGETS := ubuntu22.04 ubuntu24.04 ubuntu25.10 ubuntu26.04 debian12 debian13
+RPM_TARGETS := rocky8 rocky9 rocky10 tumbleweed rawhide fedora42 fedora43 amzn2023
 SLE_TARGETS := sle15sp6 sle15sp7 sle16
-ALL_PACKAGE_TARGETS := $(DEB_TARGETS) $(RPM_TARGETS) $(SLE_TARGETS)
+GENTOO_TARGETS := gentoo
+ALL_PACKAGE_TARGETS := $(DEB_TARGETS) $(RPM_TARGETS) $(SLE_TARGETS) $(GENTOO_TARGETS)
+
+# ARM64 (aarch64) targets — rocky8 excluded (EOL, no aarch64 builds)
+DEB_ARM64_TARGETS := $(addprefix arm64-,$(DEB_TARGETS))
+RPM_ARM64_TARGETS := $(addprefix arm64-,$(filter-out rocky8,$(RPM_TARGETS)))
+SLE_ARM64_TARGETS := $(addprefix arm64-,$(SLE_TARGETS))
+ALL_ARM64_TARGETS := $(DEB_ARM64_TARGETS) $(RPM_ARM64_TARGETS) $(SLE_ARM64_TARGETS)
 
 install: ## Install packages from ./packaging onto this host (apt/dnf/yum/zypper auto-detected)
 	@set -euo pipefail; \
@@ -83,14 +141,16 @@ install: ## Install packages from ./packaging onto this host (apt/dnf/yum/zypper
 		PKGTYPE="rpm"; INSTALL_CMD='(command -v dnf >/dev/null && dnf -y install ./packaging/*.rpm) || \
 		                            (command -v yum >/dev/null && yum -y localinstall ./packaging/*.rpm) || \
 		                            (command -v zypper >/dev/null && zypper --non-interactive --no-gpg-checks in ./packaging/*.rpm)';; \
+	  gentoo) \
+		PKGTYPE="gentoo"; INSTALL_CMD='python3 scripts/install_local.py --no-build --destdir $(DESTDIR)/';; \
 	esac; \
 	if [ -z "$$PKGTYPE" ]; then echo "Error: unknown distro family for install"; exit 2; fi; \
 	if [ "$$PKGTYPE" = "deb" ]; then \
 	  ls ./packaging/*.deb >/dev/null 2>&1 || { echo "Error: no .deb packages in ./packaging/ — run 'make' first"; exit 4; }; \
-	else \
+	elif [ "$$PKGTYPE" = "rpm" ]; then \
 	  ls ./packaging/*.rpm >/dev/null 2>&1 || { echo "Error: no .rpm packages in ./packaging/ — run 'make' first"; exit 4; }; \
 	fi; \
-	echo "Installing from ./packaging/…"; \
+	echo "Installing..."; \
 	sh -c "$$INSTALL_CMD"; \
 	echo "Install complete."
 
@@ -108,7 +168,7 @@ uninstall: ## Uninstall Himmelblau packages from this host (apt/dnf/yum/zypper a
 	else \
 		echo "Error: no supported package manager found (apt/dnf/yum/zypper)."; exit 2; \
 	fi; \
-	pkgs="himmelblau himmelblau-qr-greeter himmelblau-selinux himmelblau-sshd-config himmelblau-sso nss-himmelblau pam-himmelblau"; \
+	pkgs="himmelblau himmelblau-broker himmelblau-qr-greeter himmelblau-selinux himmelblau-sshd-config himmelblau-sso himmelblau-sso-policies nss-himmelblau pam-himmelblau"; \
 	echo "Removing: $$pkgs"; \
 	$$PM $$pkgs; \
 	echo "Uninstall complete."
@@ -116,21 +176,28 @@ uninstall: ## Uninstall Himmelblau packages from this host (apt/dnf/yum/zypper a
 dockerfiles:
 	python3 scripts/gen_dockerfiles.py --out ./images/ $(PATCH_LIBHIMMELBLAU)
 
+dockerfiles-arm64:
+	python3 scripts/gen_dockerfiles.py --out ./images/ --arch arm64 $(PATCH_LIBHIMMELBLAU)
+
 deb-servicefiles:
 	python3 ./scripts/gen_servicefiles.py --out ./platform/debian/
 
 rpm-servicefiles:
 	python3 ./scripts/gen_servicefiles.py --out ./platform/opensuse/
 
-.PHONY: package deb rpm $(DEB_TARGETS) $(RPM_TARGETS) ${SLE_TARGETS} dockerfiles deb-servicefiles rpm-servicefiles install uninstall help sbom
+authselect:
+	python3 ./scripts/gen_authselect.py --root=./ --aad-tool=./target/release/aad-tool --output-dir=./platform/el/authselect/
+
+.PHONY: package deb rpm $(DEB_TARGETS) $(RPM_TARGETS) ${SLE_TARGETS} $(GENTOO_TARGETS) dockerfiles dockerfiles-arm64 deb-servicefiles rpm-servicefiles authselect install uninstall help sbom man arm64 deb-arm64 rpm-arm64 $(ALL_ARM64_TARGETS)
 
 check-licenses: ## Validate dependant licenses comply with GPLv3
 	cargo deny -V >/dev/null || (echo "cargo-deny required" && cargo install cargo-deny)
 	cargo deny --all-features check licenses
 
-vet: ## Vet Dependencies
+vet: ## Interactive dependency review with AI analysis
 	cargo vet -V >/dev/null || (echo "cargo-vet required" && cargo install cargo-vet)
-	cargo vet || echo "Use |cargo vet inspect| to vet the changes to each crate"
+	cargo vet regenerate imports
+	@python3 scripts/cargo_vet_review.py --ai-provider claude
 
 sbom: .packaging ## Generate a Software Bill of Materials
 	cargo sbom -V >/dev/null || (echo "cargo-sbom required" && cargo install cargo-sbom)
@@ -138,6 +205,9 @@ sbom: .packaging ## Generate a Software Bill of Materials
 
 package: deb rpm sbom ## Build packages for all supported distros (DEB+RPM)
 	ls ./packaging/
+
+man: ## Generate the himmelblau.conf man page
+	python3 src/common/scripts/gen_param_code.py --gen-man --man-output man/man5/himmelblau.conf.5
 
 # ---- failure tracking (used by deb/rpm/package) ----
 FAIL_DIR := $(CURDIR)/target/fail
@@ -152,7 +222,7 @@ deb: .packaging dockerfiles ## Build all DEB targets (continue on failure, summa
 	  if $(MAKE) --no-print-directory $$t; then :; else \
 	    echo "$$t" >> "$(FAIL_FILE)"; echo "FAIL: $$t build failed"; rm -f "$$mark"; continue; \
 	  fi; \
-	  cnt=$$(find ./packaging -type f -newer "$$mark" -name "himmelblau_*-$${t}_amd64.deb" | wc -l); \
+	  cnt=$$(find ./packaging -type f -newer "$$mark" -name "himmelblau_*-$${t}*_amd64.deb" | wc -l); \
 	  if [ "$$cnt" -gt 0 ]; then \
 	    echo "OK: $$t produced .deb(s)"; \
 	  else \
@@ -225,6 +295,7 @@ $(DEB_TARGETS): %: .packaging dockerfiles
 	mkdir -p target/$@
 	$(DOCKER) build $(LIBHIMMELBLAU_BUILD_ARG) -t himmelblau-$@-build -f images/Dockerfile.$@ .
 	$(DOCKER) run --rm --security-opt label=disable -it \
+		-e DEB_REVISION_APPEND=$(DEB_REVISION_APPEND) \
 		-v $(CURDIR):/himmelblau \
 		-v $(CURDIR)/target/$@:/himmelblau/target \
 		$(LIBHIMMELBLAU_MOUNT) \
@@ -272,6 +343,135 @@ $(SLE_TARGETS): %: .packaging dockerfiles
 				mv $$f $${f%.rpm}-$@.rpm; \
 			done && mv ./target/generate-rpm/*.rpm ./packaging/'
 
+$(GENTOO_TARGETS): %: .packaging dockerfiles
+	@echo "Generating $@ ebuild"
+	$(DOCKER) build -t himmelblau-$@-build -f images/Dockerfile.$@ .
+	$(DOCKER) run --rm --security-opt label=disable \
+		-v $(CURDIR):/himmelblau \
+		himmelblau-$@-build
+	@echo "Building from local sources..."
+	python3 scripts/gen_servicefiles.py --out ./platform/opensuse/
+	cargo build --release --features tpm
+	strip -s target/release/*.so 2>/dev/null || true
+	strip -s target/release/aad-tool target/release/himmelblaud target/release/himmelblaud_tasks target/release/broker target/release/linux-entra-sso 2>/dev/null || true
+
+# ---- ARM64 (aarch64) build targets -------------------------------------------
+# Uses docker buildx with QEMU emulation to build natively for arm64.
+# Prerequisites:
+#   docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+#   docker buildx create --name himmelblau-arm64 --use  (or use default builder)
+#
+# Usage:
+#   make arm64-ubuntu24.04      # build one distro for arm64
+#   make deb-arm64              # build all DEB targets for arm64
+#   make rpm-arm64              # build all RPM targets for arm64
+#   make arm64                  # build all arm64 targets
+
+DOCKER_BUILDX := $(DOCKER) buildx build --platform linux/arm64 --load
+
+arm64: .packaging dockerfiles-arm64 deb-arm64 rpm-arm64 ## Build all ARM64 packages
+
+deb-arm64: .packaging dockerfiles-arm64 ## Build all DEB targets for ARM64
+	@set -e; mkdir -p "$(FAIL_DIR)"; rm -f "$(FAIL_FILE)" "$(MISS_FILE)"; \
+	for t in $(DEB_ARM64_TARGETS); do \
+	  echo "==== [DEB-ARM64] Building $$t ===="; \
+	  mark="$$(mktemp)"; \
+	  if $(MAKE) --no-print-directory $$t; then :; else \
+	    echo "$$t" >> "$(FAIL_FILE)"; echo "FAIL: $$t build failed"; rm -f "$$mark"; continue; \
+	  fi; \
+	  cnt=$$(find ./packaging -type f -newer "$$mark" -name "himmelblau_*_arm64.deb" | wc -l); \
+	  if [ "$$cnt" -gt 0 ]; then \
+	    echo "OK: $$t produced .deb(s)"; \
+	  else \
+	    echo "$$t" >> "$(MISS_FILE)"; echo "WARN: $$t produced no .deb artifacts"; \
+	  fi; \
+	  rm -f "$$mark"; \
+	done
+
+rpm-arm64: .packaging dockerfiles-arm64 ## Build all RPM targets for ARM64
+	@set -e; mkdir -p "$(FAIL_DIR)"; : > /dev/null; \
+	for t in $(RPM_ARM64_TARGETS) $(SLE_ARM64_TARGETS); do \
+	  echo "==== [RPM-ARM64] Building $$t ===="; \
+	  mark="$$(mktemp)"; \
+	  if $(MAKE) --no-print-directory $$t; then :; else \
+	    echo "$$t" >> "$(FAIL_FILE)"; echo "FAIL: $$t build failed"; rm -f "$$mark"; continue; \
+	  fi; \
+	  distro=$$(echo "$$t" | sed 's/^arm64-//'); \
+	  cnt=$$(find ./packaging -type f -newer "$$mark" -name "*-$${distro}.aarch64.rpm" | wc -l); \
+	  if [ "$$cnt" -gt 0 ]; then \
+	    echo "OK: $$t produced .rpm(s)"; \
+	  else \
+	    echo "$$t" >> "$(MISS_FILE)"; echo "WARN: $$t produced no .rpm artifacts"; \
+	  fi; \
+	  rm -f "$$mark"; \
+	done
+
+# ARM64 DEB build rules — cross-compile on amd64 (no QEMU emulation)
+$(DEB_ARM64_TARGETS): arm64-%: .packaging dockerfiles-arm64
+	@distro=$*; \
+	echo "Building ARM64 $$distro DEB packages (cross-compilation)"; \
+	mkdir -p target/arm64-$$distro
+	$(DOCKER) build $(LIBHIMMELBLAU_BUILD_ARG) \
+		-t himmelblau-arm64-$*-build \
+		-f images/Dockerfile.$*.arm64 .
+	$(DOCKER) run --rm --security-opt label=disable \
+		-e DEB_REVISION_APPEND=$(DEB_REVISION_APPEND) \
+		-v $(CURDIR):/himmelblau \
+		-v $(CURDIR)/target/arm64-$*:/himmelblau/target \
+		$(LIBHIMMELBLAU_MOUNT) \
+		himmelblau-arm64-$*-build
+	$(DOCKER) run --rm --security-opt label=disable \
+		-v $(CURDIR):/himmelblau \
+		-v $(CURDIR)/target/arm64-$*:/himmelblau/target \
+		$(LIBHIMMELBLAU_MOUNT) \
+		himmelblau-arm64-$*-build /bin/sh -c \
+			'mv ./target/debian/*.deb ./packaging/'
+
+# ARM64 RPM build rules (non-SLE)
+$(RPM_ARM64_TARGETS): arm64-%: .packaging dockerfiles-arm64
+	@distro=$*; \
+	echo "Building ARM64 $$distro RPM packages"; \
+	mkdir -p target/arm64-$$distro
+	$(DOCKER_BUILDX) $(LIBHIMMELBLAU_BUILD_ARG) \
+		-t himmelblau-arm64-$*-build \
+		-f images/Dockerfile.$*.arm64 .
+	$(DOCKER) run --rm --security-opt label=disable --platform linux/arm64 \
+		-v $(CURDIR):/himmelblau \
+		-v $(CURDIR)/target/arm64-$*:/himmelblau/target \
+		$(LIBHIMMELBLAU_MOUNT) \
+		himmelblau-arm64-$*-build
+	$(DOCKER) run --rm --security-opt label=disable --platform linux/arm64 \
+		-v $(CURDIR):/himmelblau \
+		-v $(CURDIR)/target/arm64-$*:/himmelblau/target \
+		$(LIBHIMMELBLAU_MOUNT) \
+		himmelblau-arm64-$*-build /bin/sh -c \
+			'for f in ./target/generate-rpm/*.rpm; do \
+				mv $$f $${f%.rpm}-$*.rpm; \
+			done && mv ./target/generate-rpm/*.rpm ./packaging/'
+
+# ARM64 SLE RPM build rules
+$(SLE_ARM64_TARGETS): arm64-%: .packaging dockerfiles-arm64
+	@distro=$*; \
+	echo "Building ARM64 $$distro SLE RPM packages"; \
+	mkdir -p target/arm64-$$distro
+	$(DOCKER_BUILDX) --secret id=scc_regcode,src=${HOME}/.secrets/scc_regcode \
+		$(LIBHIMMELBLAU_BUILD_ARG) \
+		-t himmelblau-arm64-$*-build \
+		-f images/Dockerfile.$*.arm64 .
+	$(DOCKER) run --rm --security-opt label=disable --platform linux/arm64 \
+		-v $(CURDIR):/himmelblau \
+		-v $(CURDIR)/target/arm64-$*:/himmelblau/target \
+		$(LIBHIMMELBLAU_MOUNT) \
+		himmelblau-arm64-$*-build
+	$(DOCKER) run --rm --security-opt label=disable --platform linux/arm64 \
+		-v $(CURDIR):/himmelblau \
+		-v $(CURDIR)/target/arm64-$*:/himmelblau/target \
+		$(LIBHIMMELBLAU_MOUNT) \
+		himmelblau-arm64-$*-build /bin/sh -c \
+			'for f in ./target/generate-rpm/*.rpm; do \
+				mv $$f $${f%.rpm}-$*.rpm; \
+			done && mv ./target/generate-rpm/*.rpm ./packaging/'
+
 # Pretty/help colors (safe if your shell prints raw escapes; adjust or remove if you prefer plain)
 HELP_COL := \033[36m
 HELP_RST := \033[0m
@@ -286,10 +486,19 @@ help: ## Show this help
 	     }' $(MAKEFILE_LIST)
 	@printf "\nPer-distro build targets (build only that distro):\n"
 	@for t in $(ALL_PACKAGE_TARGETS); do printf "  - %s\n" "make $$t"; done
+	@printf "\nARM64 (aarch64) build targets:\n"
+	@printf "  make arm64                  Build all ARM64 packages\n"
+	@printf "  make deb-arm64              Build all DEB targets for ARM64\n"
+	@printf "  make rpm-arm64              Build all RPM targets for ARM64\n"
+	@printf "  make arm64-<distro>         Build a specific distro for ARM64\n"
+	@printf "  Supported: %s\n" "$(ALL_ARM64_TARGETS)"
 	@printf "\nDetected tools:\n  DOCKER: %s\n  NIX: %s\n" "$(DOCKER)" "$(NIX)"
 	@printf "\nTips:\n"
 	@printf "  • Running plain 'make' invokes the default 'all' target (auto-detects host distro).\n"
 	@printf "  • You can install a development build of Himmelblau on the current host with 'make && sudo make install'\n"
 	@printf "  • Built packages are written to ./packaging/\n"
-	@printf "  • To use local libhimmelblau: LIBHIMMELBLAU_LOCAL=/path/to/libhimmelblau make <target>\n\n"
+	@printf "  • To use local libhimmelblau: LIBHIMMELBLAU_LOCAL=/path/to/libhimmelblau make <target>\n"
+	@printf "  • ARM64 DEB builds use cross-compilation (no QEMU needed).\n"
+	@printf "  • ARM64 RPM builds use docker buildx with QEMU emulation. Setup:\n"
+	@printf "      docker run --rm --privileged multiarch/qemu-user-static --reset -p yes\n\n"
 	@printf "If you'd like a new distro added to the supported packages list, contact a maintainer. We're happy to help.\n"

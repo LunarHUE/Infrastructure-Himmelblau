@@ -8,6 +8,7 @@ target/
 result
 result-man
 result-doc
+result-lib
 
 # direnv state
 .direnv/
@@ -25,12 +26,16 @@ packaging/
 # VM image for nixos testing
 *.qcow2
 
-src/selinux/src/himmelblaud.if
 src/selinux/src/himmelblaud.pp
 src/selinux/src/tmp/
 
 # Generated systemd service files
 platform/debian/himmelblaud-tasks.service
 platform/debian/himmelblaud.service
+platform/debian/himmelblau-hsm-pin-init.service
 platform/opensuse/himmelblaud-tasks.service
 platform/opensuse/himmelblaud.service
+platform/opensuse/himmelblau-hsm-pin-init.service
+
+platform/el/authselect
+scripts/__pycache__

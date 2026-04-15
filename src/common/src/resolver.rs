@@ -11,6 +11,7 @@
 // use async_trait::async_trait;
 use hashbrown::HashSet;
 use libc::uid_t;
+use libkrimes::proto::KerberosCredentials;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::fs;
@@ -67,6 +68,7 @@ pub enum AuthSession {
         /// when they need to stop.
         shutdown_rx: broadcast::Receiver<()>,
         no_hello_pin: bool,
+        force_reauth: bool,
     },
     Success(String),
     Denied,
@@ -202,6 +204,17 @@ where
         })
     }
 
+    /// Export broker PRTs from the identity provider for fdstore
+    /// persistence across daemon restarts.
+    pub async fn export_broker_prts(&self) -> Result<Vec<u8>, serde_json::Error> {
+        self.client.export_broker_prts().await
+    }
+
+    /// Import broker PRTs previously exported by [`Self::export_broker_prts`].
+    pub async fn import_broker_prts(&self, data: &[u8]) -> Result<(), serde_json::Error> {
+        self.client.import_broker_prts(data).await
+    }
+
     async fn get_cachestate(&self, account_id: Option<&str>) -> CacheState {
         let mut dbtxn = self.db.write().await;
         let res = self.client.get_cachestate(account_id, &mut dbtxn).await;
@@ -218,7 +231,11 @@ where
         let mut nxcache_txn = self.nxcache.lock().await;
         nxcache_txn.clear();
         let mut dbtxn = self.db.write().await;
-        dbtxn.clear().and_then(|_| dbtxn.commit()).map_err(|_| ())?;
+        dbtxn
+            .clear()
+            .and_then(|_| dbtxn.clear_hello_keys())
+            .and_then(|_| dbtxn.commit())
+            .map_err(|_| ())?;
 
         // Also delete the generated himmelblau.conf. This unjoins the host!
         let path = Path::new(SERVER_CONFIG_PATH);
@@ -583,6 +600,8 @@ where
         account_id: Id,
         scopes: Vec<String>,
         client_id: Option<String>,
+        redirect_uri: Option<String>,
+        req_cnf: Option<String>,
     ) -> Option<UnixUserToken> {
         // Validate the user isn't in the nxset (aka, it's a local user or group).
         let (name, idnumber) = match account_id.clone() {
@@ -611,6 +630,8 @@ where
                 scopes,
                 Some(&token),
                 client_id,
+                redirect_uri,
+                req_cnf,
                 &mut dbtxn,
                 hsm_lock.deref_mut(),
                 &self.machine_key,
@@ -632,10 +653,17 @@ where
         }
     }
 
-    pub async fn get_user_ccaches(
+    pub async fn get_user_tgts(
         &self,
         account_id: Id,
-    ) -> Option<(uid_t, uid_t, Vec<u8>, Vec<u8>)> {
+    ) -> Option<(
+        uid_t,
+        uid_t,
+        Option<Box<KerberosCredentials>>,
+        Option<Box<KerberosCredentials>>,
+        Option<String>,
+        Option<String>,
+    )> {
         // Validate the user isn't in the nxset (aka, it's a local user or group).
         let (name, idnumber) = match account_id.clone() {
             Id::Name(name) => (Some(name), None),
@@ -656,9 +684,9 @@ where
         let mut hsm_lock = self.hsm.lock().await;
         let mut dbtxn = self.db.write().await;
 
-        let (cloud_ccache, ad_ccache) = self
+        let (cloud_ccache, ad_ccache, top_level_names, tenant_id) = self
             .client
-            .unix_user_ccaches(
+            .unix_user_tgts(
                 &account_id,
                 Some(&token),
                 &mut dbtxn,
@@ -678,10 +706,16 @@ where
             token.real_gidnumber.unwrap_or(token.gidnumber),
             cloud_ccache,
             ad_ccache,
+            top_level_names,
+            tenant_id,
         ))
     }
 
-    pub async fn get_user_prt_cookie(&self, account_id: Id) -> Option<String> {
+    pub async fn get_user_prt_cookie(
+        &self,
+        account_id: Id,
+        sso_nonce: Option<&str>,
+    ) -> Option<String> {
         // Validate the user isn't in the nxset (aka, it's a local user or group).
         let (name, idnumber) = match account_id.clone() {
             Id::Name(name) => (Some(name), None),
@@ -707,6 +741,7 @@ where
             .unix_user_prt_cookie(
                 &account_id,
                 Some(&token),
+                sso_nonce,
                 &mut dbtxn,
                 hsm_lock.deref_mut(),
                 &self.machine_key,
@@ -1019,6 +1054,11 @@ where
         self.get_nssgroup(Id::Gid(gid)).await
     }
 
+    pub async fn get_initgroups(&self, account_id: &str) -> Result<Option<Vec<u32>>, ()> {
+        let token = self.get_usertoken(Id::Name(account_id.to_string())).await?;
+        Ok(token.map(|tok| tok.groups.iter().map(|g| g.gidnumber).collect()))
+    }
+
     pub async fn pam_account_allowed(&self, account_id: &str) -> Result<Option<bool>, ()> {
         let token = self.get_usertoken(Id::Name(account_id.to_string())).await?;
 
@@ -1060,6 +1100,7 @@ where
         account_id: &str,
         service: &str,
         no_hello_pin: bool,
+        force_reauth: bool,
         shutdown_rx: broadcast::Receiver<()>,
     ) -> Result<(AuthSession, PamAuthResponse), ()> {
         // Setup an auth session. If possible bring the resolver online.
@@ -1100,7 +1141,9 @@ where
                 .unix_user_online_auth_init(
                     account_id,
                     token.as_ref(),
+                    service,
                     no_hello_pin,
+                    force_reauth,
                     &mut dbtxn,
                     hsm_lock.deref_mut(),
                     &self.machine_key,
@@ -1110,23 +1153,39 @@ where
             {
                 Ok(res) => Ok(res),
                 Err(e) => {
-                    // Check if the failure is because we went offline
-                    match self.get_cachestate(Some(account_id)).await {
-                        CacheState::Offline | CacheState::OfflineNextCheck(_) => {
-                            // Attempt to proceed offline
-                            self.client
-                                .unix_user_offline_auth_init(
-                                    account_id,
-                                    token.as_ref(),
-                                    no_hello_pin,
-                                    &mut dbtxn,
-                                )
-                                .await
+                    if force_reauth {
+                        // force_reauth requires online auth, do not fall back
+                        // to offline, as that cannot satisfy Entra sign-in
+                        // frequency policy.
+                        Err(e)
+                    } else {
+                        // Check if the failure is because we went offline
+                        match self.get_cachestate(Some(account_id)).await {
+                            CacheState::Offline | CacheState::OfflineNextCheck(_) => {
+                                // Attempt to proceed offline
+                                self.client
+                                    .unix_user_offline_auth_init(
+                                        account_id,
+                                        token.as_ref(),
+                                        no_hello_pin,
+                                        &mut dbtxn,
+                                    )
+                                    .await
+                            }
+                            _ => Err(e),
                         }
-                        _ => Err(e),
                     }
                 }
             }
+        } else if force_reauth {
+            // force_reauth requires online connectivity, so refuse to proceed
+            // offline since cached auth cannot satisfy Entra sign-in frequency.
+            return Ok((
+                AuthSession::Denied,
+                PamAuthResponse::InitDenied {
+                    msg: "Re-authentication requires network connectivity.".to_string(),
+                },
+            ));
         } else {
             let mut dbtxn = self.db.write().await;
 
@@ -1147,6 +1206,7 @@ where
                     cred_handler,
                     shutdown_rx,
                     no_hello_pin,
+                    force_reauth,
                 };
 
                 // Now identify what credentials are needed next. The auth session tells
@@ -1180,6 +1240,7 @@ where
                 cred_handler: _,
                 shutdown_rx: _,
                 no_hello_pin: _,
+                force_reauth: _,
             } => self.get_cachestate(Some(account_id)).await,
             _ => self.get_cachestate(None).await,
         };
@@ -1195,6 +1256,7 @@ where
                     ref mut cred_handler,
                     ref shutdown_rx,
                     no_hello_pin,
+                    force_reauth: _,
                 },
                 CacheState::Online,
             ) => {
@@ -1270,9 +1332,17 @@ where
                     // Only need in online auth.
                     shutdown_rx: _,
                     no_hello_pin: _,
+                    force_reauth,
                 },
                 _,
             ) => {
+                // force_reauth requires online auth, refuse offline fallback.
+                if force_reauth {
+                    return Ok(PamAuthResponse::Denied(
+                        "Re-authentication requires network connectivity.".to_string(),
+                    ));
+                }
+
                 // We are offline, continue. Remember, authsession should have
                 // *everything you need* to proceed here!
                 //
@@ -1304,7 +1374,7 @@ where
                         // AuthCredHandler::ChangePassword is invalid for offline auth
                         return Err(());
                     }
-                    (_, PamAuthRequest::Pin { .. }) => {
+                    (_, PamAuthRequest::Pin { .. }) | (_, PamAuthRequest::HelloTOTP { .. }) => {
                         // The Pin acts as a single device password, and can be
                         // used to unlock the TPM to validate the authentication.
                         let mut hsm_lock = self.hsm.lock().await;
@@ -1329,6 +1399,10 @@ where
 
                         auth_result
                     }
+                    (AuthCredHandler::HelloTOTP { .. }, _) => {
+                        // AuthCredHandler::HelloTOTP with anything other than HelloTOTP is invalid
+                        return Err(());
+                    }
                     (AuthCredHandler::None, PamAuthRequest::MFACode { .. }) => {
                         // AuthCredHandler::None is invalid with MFACode
                         return Err(());
@@ -1343,6 +1417,15 @@ where
                     }
                     (AuthCredHandler::None, PamAuthRequest::Fido { .. }) => {
                         // AuthCredHandler::None is invalid with Fido
+                        return Err(());
+                    }
+                    (AuthCredHandler::PasswordFirst { .. }, _) => {
+                        // AuthCredHandler::PasswordFirst with anything other than
+                        // PamAuthRequest::Password is invalid.
+                        return Err(());
+                    }
+                    (AuthCredHandler::ReauthPassword { .. }, _) => {
+                        // AuthCredHandler::ReauthPassword is invalid for offline auth.
                         return Err(());
                     }
                 }
@@ -1399,6 +1482,57 @@ where
             Err(e) => {
                 error!("{:?}", e);
                 Err(())
+            }
+        }
+    }
+
+    /// One-shot PIN-based unseal: runs auth init and, if the daemon
+    /// requests a PIN, immediately submits it. Returns Ok(true) on
+    /// success, Ok(false) on auth failure, Err(()) on internal error.
+    pub async fn pam_try_unseal(
+        &self,
+        account_id: &str,
+        cred: &str,
+    ) -> Result<bool, ()> {
+        let (shutdown_tx, _) = broadcast::channel(1);
+
+        let (mut auth_session, init_resp) = self
+            .pam_account_authenticate_init(
+                account_id,
+                "try_unseal",
+                false,
+                false,
+                shutdown_tx.subscribe(),
+            )
+            .await?;
+
+        // Only proceed if the daemon is asking for a PIN.
+        match init_resp {
+            PamAuthResponse::Pin => {}
+            PamAuthResponse::Success => {
+                debug!("pam_try_unseal: already unsealed");
+                return Ok(true);
+            }
+            _ => {
+                debug!("pam_try_unseal: daemon did not request PIN (got {:?})", init_resp);
+                return Ok(false);
+            }
+        }
+
+        let step_resp = self
+            .pam_account_authenticate_step(
+                &mut auth_session,
+                PamAuthRequest::Pin {
+                    cred: cred.to_string(),
+                },
+            )
+            .await?;
+
+        match step_resp {
+            PamAuthResponse::Success => Ok(true),
+            _ => {
+                debug!("pam_try_unseal: PIN auth failed (got {:?})", step_resp);
+                Ok(false)
             }
         }
     }

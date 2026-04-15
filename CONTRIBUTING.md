@@ -9,6 +9,8 @@ This document explains how to get involved, set up your environment, and follow 
 All contributors are expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md).  
 Please read it before participating in issues, discussions, or pull requests.
 
+Please also read the [Contributor Policy](CONTRIBUTOR_POLICY.md), which documents review expectations, AI-assisted contribution requirements, and automated PR triage behavior.
+
 ---
 
 ## How to Contribute
@@ -64,13 +66,42 @@ sudo make uninstall
 
 ---
 
+## Git Hooks
+
+The repository includes a pre-commit hook that runs automatic checks and regenerates
+generated files. To enable:
+
+```bash
+make setup-hooks
+```
+
+This configures git to use `.githooks/pre-commit`, which handles:
+
+**SELinux Policy Tests:** When SELinux policy files (`src/selinux/src/himmelblaud.te` or
+`.fc`) are modified, the hook runs `make test-selinux` to verify the policy builds
+correctly across all supported distros.
+
+**NixOS Options and Man Page Regeneration:** When XML parameter definitions in
+`docs-xml/himmelblauconf/` or the generator script are modified, the hook regenerates:
+
+* `nix/modules/himmelblau-options.nix` - Typed NixOS module options
+* `man/man5/himmelblau.conf.5` - Man page documentation
+
+**Cargo.nix Regeneration:** When `Cargo.lock` is staged, the hook runs
+`nix run nixpkgs#crate2nix -- generate` and stages any resulting `Cargo.nix` updates.
+
+Note: Rust code generation is handled by the build system, not the pre-commit hook.
+
+---
+
 ## Coding Guidelines
 
 * **Rust Style:** Run `cargo fmt` before committing.
 * **Linting:** Use `cargo clippy --all-targets --all-features` to catch common issues.
 * **Testing:** Run `cargo test` before opening a PR.
-* **Commits:** Write clear commit messages in the imperative mood (e.g., “Add Intune compliance check”). Add a signed-off tag to each commit (`git commit --signoff`).
+* **Commits:** Write clear commit messages in the imperative mood (e.g., "Add Intune compliance check"). Add a signed-off tag to each commit (`git commit --signoff`).
 * **Docs:** Update relevant documentation/man pages when you change functionality.
+* **Config Parameters:** When adding or modifying configuration options, update the XML definitions in `docs-xml/himmelblauconf/`. The pre-commit hook will regenerate Rust code, man pages, and NixOS options automatically.
 
 ---
 
@@ -117,4 +148,3 @@ If contributing packaging fixes, test on at least one supported distro and note 
 ## Recognition
 
 Contributors are recognized in release notes. Your contributions help make Linux a **first-class citizen** in enterprise identity environments.
-
